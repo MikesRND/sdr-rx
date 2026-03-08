@@ -1,6 +1,10 @@
 # sdr-rx
 
-Generic NFM SDR monitor — monitors a configurable narrowband FM radio channel using an RTL-SDR dongle. Provides RF power squelch, DCS/DPL tone decoding, automatic transmission recording, and a real-time web dashboard.
+Generic NFM SDR monitor/recorder — monitors a configurable narrowband FM radio channel using an RTL-SDR dongle. Provides RF power squelch, DCS/DPL tone decoding, automatic transmission recording, and a real-time web dashboard.
+
+## Architecture
+
+See [DESIGN.md](DESIGN.md) for the full design document with signal flow diagrams, threading model, and DSP details. See [CONTRIBUTING.md](CONTRIBUTING.md) for developer reference.
 
 ## Prerequisites
 
@@ -89,7 +93,3 @@ Per-channel data is stored under `~/.local/share/sdr-rx/<channel_id>/`:
 ```
 
 Override with `--data-dir` or `SDR_RX_DATA_DIR` environment variable.
-
-## Architecture
-
-See [DESIGN.md](DESIGN.md) for the full design document with signal flow diagrams, threading model, and DSP details. See [CONTRIBUTING.md](CONTRIBUTING.md) for developer reference.
