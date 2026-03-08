@@ -1,0 +1,133 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>SDR Monitor</title>
+    <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+
+<header>
+    <h1 id="channelName">SDR Monitor</h1>
+    <div class="status-bar">
+        <div class="status-item">
+            <span class="indicator squelch-closed" id="squelchIndicator"></span>
+            <span>Squelch</span>
+        </div>
+        <div class="status-item">
+            <span class="indicator dcs-off" id="dcsIndicator"></span>
+            <span id="dcsLabel">DCS ---</span>
+        </div>
+        <div class="status-item">
+            <span class="indicator rec-off" id="recIndicator"></span>
+            <span>REC</span>
+        </div>
+        <div class="status-item">
+            <span id="stateLabel" class="state-label state-IDLE">IDLE</span>
+        </div>
+        <div class="status-item">
+            TX: <span id="txCount">0</span>
+        </div>
+        <div class="status-item dcs-stats" id="dcsStats" style="display:none;">
+            DCS: <span id="dcsMatchRate">0</span>%
+        </div>
+        <div class="status-item conn-status disconnected" id="connStatus">
+            disconnected
+        </div>
+    </div>
+</header>
+
+<div class="main-grid">
+    <!-- Left column: signal + log -->
+    <div class="left-col">
+        <!-- Signal Level -->
+        <div class="panel signal-meter">
+            <h2>Signal Level &mdash; <span id="freqLabel">---</span> MHz NFM</h2>
+            <div class="meter-wrap">
+                <div class="meter-bar-container" id="meterContainer">
+                    <div class="meter-bar low" id="meterBar" style="width: 0%"></div>
+                    <div class="meter-threshold" id="meterThreshold" style="left: 50%">
+                        <span class="meter-threshold-arrow top"></span>
+                        <span class="meter-threshold-arrow bot"></span>
+                    </div>
+                </div>
+                <div class="meter-scale" aria-hidden="true">
+                    <span style="position:absolute;left:0">-70</span>
+                    <span style="position:absolute;left:23%">-55</span>
+                    <span style="position:absolute;left:46%">-40</span>
+                    <span style="position:absolute;left:69%">-25</span>
+                    <span style="position:absolute;right:0">-5</span>
+                </div>
+                <div class="meter-readout">
+                    <span class="rssi-value"><span id="rssiValue">---</span> <span class="rssi-unit" id="rssiUnit">dBFS</span></span>
+                    <span class="squelch-readout">Squelch <span id="thresholdLabel">-30.0</span> <span id="squelchUnit">dBFS</span></span>
+                </div>
+            </div>
+        </div>
+
+        <!-- Transmission Log -->
+        <div class="panel">
+            <h2>Transmission Log</h2>
+            <div class="tx-log">
+                <table>
+                    <thead>
+                        <tr>
+                            <th>Time</th>
+                            <th>Duration</th>
+                            <th>Peak RSSI</th>
+                            <th>DCS</th>
+                            <th>Audio</th>
+                        </tr>
+                    </thead>
+                    <tbody id="txLogBody">
+                    </tbody>
+                </table>
+            </div>
+        </div>
+    </div>
+
+    <!-- Right column: controls + audio -->
+    <div class="right-col">
+        <!-- Controls -->
+        <div class="panel">
+            <h2>Controls</h2>
+            <input type="hidden" id="squelchSlider" value="-30">
+            <div class="gain-row">
+                <span class="gain-label">RF Gain</span>
+                <div class="gain-slider" id="gainTrack">
+                    <div class="gain-slider-fill" id="gainFill"></div>
+                    <div class="gain-slider-thumb" id="gainThumb"></div>
+                </div>
+                <span class="gain-value"><span id="gainValue">40</span></span>
+                <input type="hidden" id="gainSlider" min="0" max="50" step="1" value="40">
+            </div>
+        </div>
+
+        <!-- Live Audio -->
+        <div class="panel">
+            <div class="audio-header">
+                <h2>Live Audio</h2>
+                <span class="audio-status-inline" id="audioStatus">Stopped</span>
+            </div>
+            <button id="audioToggle">Start Audio</button>
+        </div>
+
+        <!-- Info -->
+        <div class="panel">
+            <h2>Info</h2>
+            <div class="info-grid">
+                <div>Freq: <span id="infoFreq">---</span> MHz</div>
+                <div>Mode: NFM</div>
+                <div>DCS: <span id="infoDcs">---</span></div>
+                <div>SDR: 240 kHz</div>
+                <div>Audio: 8 kHz</div>
+                <div>Match: <span id="infoDcsMatch">0</span>/<span id="infoDcsTotal">0</span> (<span id="infoDcsRate">0</span>%)</div>
+            </div>
+        </div>
+    </div>
+</div>
+
+<script src="/static/app.js"></script>
+</body>
+</html>

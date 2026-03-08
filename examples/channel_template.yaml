@@ -1,0 +1,23 @@
+# SDR Monitor — Channel Configuration Template
+#
+# Copy this file to ~/.config/sdr-rx/channels/<id>.yaml
+# or use: python main.py --init-channel <id>
+#
+# The filename (without .yaml) is the channel ID used for data storage.
+# The 'name' field below is a display label only — changing it does not
+# move logs or recordings.
+
+# Display name shown in the web dashboard
+name: "My Channel"
+
+# Center frequency in Hz (1 MHz – 6 GHz)
+freq_hz: 462562500       # FRS Channel 1
+
+# DCS code — octal digits as decimal (e.g. 23, 565). Set to 0 for none.
+# Digits must be 0-7 only.
+dcs_code: 0
+
+# DCS mode:
+#   advisory — DCS match status is recorded but never blocks audio (default)
+#   strict   — flags transmissions that don't match the configured DCS code
+dcs_mode: advisory
