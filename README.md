@@ -71,7 +71,6 @@ python main.py --no-record               # monitor only, no WAV recording
 python main.py --audio-preset aggressive  # tighter voice filtering
 python main.py --freq 462000000          # override frequency via CLI
 python main.py --list-channels           # show available channel configs
-python main.py --calibrate-rssi field    # RSSI calibration mode
 python main.py --data-dir /mnt/data      # override data storage location
 ```
 
@@ -86,7 +85,6 @@ Per-channel data is stored under `~/.local/share/sdr-rx/<channel_id>/`:
   default/
     audio/                    # WAV recordings (auto-cleaned at 500 MB)
     20260308.csv              # Daily transmission log
-    rssi_calibration.json     # RSSI calibration data
   weather/
     audio/
     ...

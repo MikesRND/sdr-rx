@@ -30,8 +30,7 @@ class AppCore:
 
     def __init__(self, flowgraph, audio_tap, dcs_decoder, telemetry_queue,
                  record=True, max_audio_mb=500, channel_name="FRS Ch 1",
-                 dcs_code=0, dcs_mode="advisory", paths=None,
-                 rssi_offset=0.0, rssi_calibration_tier=None):
+                 dcs_code=0, dcs_mode="advisory", paths=None):
         self._fg = flowgraph
         self._audio_tap = audio_tap
         self._dcs = dcs_decoder
@@ -44,9 +43,6 @@ class AppCore:
         self._file_prefix = sanitize_name(channel_name)
         self._channel_data_dir = paths.channel_data_dir if paths else "."
         self._audio_dir = paths.audio_dir if paths else "audio"
-        self._rssi_offset = rssi_offset
-        self._rssi_calibration_tier = rssi_calibration_tier
-
         self._state = self.IDLE
         self._running = False
         self._thread = None
@@ -101,13 +97,8 @@ class AppCore:
             if sleep_time > 0:
                 time.sleep(sleep_time)
 
-    def _apply_offset(self, rssi_dbfs):
-        """Apply calibration offset to raw RSSI."""
-        return rssi_dbfs + self._rssi_offset
-
     def _poll(self):
-        rssi_raw = self._fg.get_rssi()
-        rssi = self._apply_offset(rssi_raw)
+        rssi = self._fg.get_rssi()
         squelch_open = self._fg.get_squelch_open()
         dcs_detected = self._dcs.get_detected() if self._dcs else False
         dcs_polarity = self._dcs.get_polarity() if self._dcs else "unknown"
@@ -233,7 +224,7 @@ class AppCore:
             with open(csv_path, "a", newline="") as f:
                 writer = csv.writer(f)
                 if write_header:
-                    rssi_col = "peak_rssi_" + self._rssi_unit_label().replace(" ", "_").replace("~", "approx_")
+                    rssi_col = "peak_rssi_dBFS"
                     cols = [
                         "date", "time", "duration_sec", rssi_col,
                         "dcs_confirmed", "dcs_polarity", "filename",
@@ -309,7 +300,7 @@ class AppCore:
 
         telem = {
             "rssi": round(rssi, 1),
-            "rssi_unit": self._rssi_unit_label(),
+            "rssi_unit": "dBFS",
             "squelch_open": squelch_open,
             "squelch_threshold": self._fg.get_squelch_threshold(),
             "dcs_detected": dcs_detected,
@@ -337,13 +328,6 @@ class AppCore:
                 self._telem_q.put_nowait(telem)
             except queue.Full:
                 pass
-
-    def _rssi_unit_label(self):
-        if self._rssi_calibration_tier == "absolute":
-            return "dBm"
-        elif self._rssi_calibration_tier == "field":
-            return "~dBm (field cal)"
-        return "dBFS"
 
     def get_tx_log(self):
         """Return list of transmission log entries."""
@@ -386,7 +370,7 @@ class AppCore:
             # Separate today's entries from other days
             today_entries = [e for e in self._tx_log if e.get("date") == today]
 
-            rssi_col = "peak_rssi_" + self._rssi_unit_label().replace(" ", "_").replace("~", "approx_")
+            rssi_col = "peak_rssi_dBFS"
             cols = [
                 "date", "time", "duration_sec", rssi_col,
                 "dcs_confirmed", "dcs_polarity", "filename",

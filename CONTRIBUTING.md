@@ -21,14 +21,13 @@ Cross-thread communication:
 ## Initialization Order (main.py)
 
 1. Resolve paths (XDG) and channel config → merge with CLI overrides
-2. Load RSSI calibration JSON (if exists and freq/gain match)
-3. Create `DCSDecoderBlock` and `AudioTapBlock` instances
-4. Create `MonitorFlowgraph` with decoder + tap blocks
-5. Create `AppCore` with flowgraph + blocks + telemetry queue
-6. Create FastAPI app via `create_app()` with queue + app_core + flowgraph
-7. Wire `audio_tap._live_callback = web_app.broadcast_audio`
-8. Start flowgraph → app_core → uvicorn (each in own thread)
-9. Main thread waits on `shutdown_event`
+2. Create `DCSDecoderBlock` and `AudioTapBlock` instances
+3. Create `MonitorFlowgraph` with decoder + tap blocks
+4. Create `AppCore` with flowgraph + blocks + telemetry queue
+5. Create FastAPI app via `create_app()` with queue + app_core + flowgraph
+6. Wire `audio_tap._live_callback = web_app.broadcast_audio`
+7. Start flowgraph → app_core → uvicorn (each in own thread)
+8. Main thread waits on `shutdown_event`
 
 ## Configuration Internals
 

@@ -19,4 +19,4 @@ Thumbs.db
 # Project data (belongs in XDG dirs, not repo)
 *.wav
 *.csv
-rssi_calibration.json
+

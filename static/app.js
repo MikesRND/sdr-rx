@@ -131,11 +131,6 @@
         }
 
         rssiValue.textContent = rssi.toFixed(1);
-        if (d.rssi_unit) {
-            rssiUnit.textContent = d.rssi_unit;
-            var sqUnit = document.getElementById("squelchUnit");
-            if (sqUnit) sqUnit.textContent = d.rssi_unit;
-        }
 
         // Squelch threshold marker — skip if user is actively adjusting
         if (!squelchSlider._userSet) {

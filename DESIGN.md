@@ -7,7 +7,7 @@ Generic NFM SDR monitor using GNU Radio + FastAPI web dashboard. Channel name, f
 Key features:
 - RF power squelch on raw IQ samples (not audio energy)
 - DCS/DPL Golay(23,12) tone decoding with dual-polarity detection (configurable code)
-- Calibrated RSSI (dBFS, field-cal, or absolute-cal)
+- RSSI signal level (dBFS)
 - Web dashboard with live telemetry, audio streaming, and recording management
 - DCS match rate tracking and mismatch flagging
 
@@ -139,7 +139,7 @@ Tapped pre-squelch from the channel filter output:
 complex_to_mag_squared → moving_average(1000) → nlog10(10) → probe_signal_f
 ```
 
-Reports dBFS (dB relative to full-scale). Calibration offset converts to approximate dBm when calibrated.
+Reports dBFS (dB relative to full-scale).
 
 ### DCS Decoding
 
@@ -277,7 +277,7 @@ Vanilla HTML/CSS/JS, no frameworks. Dark theme with CSS grid layout. Responsive 
 Components:
 - Status bar with LED indicators (squelch, DCS, recording, connection)
 - Signal level meter (color-coded bar with threshold marker)
-- Numeric RSSI display with calibration-aware units
+- Numeric RSSI display (dBFS)
 - Squelch threshold and gain sliders (live update via WebSocket)
 - Live audio button (Web Audio API with jitter buffer)
 - Transmission log table (scrollable, newest first, with play/download/delete per row)
@@ -335,26 +335,7 @@ sdr-rx/
 --tx-tail            Seconds of squelch-closed before ending TX (default: 2.0)
 --audio-preset       Voice processing preset: conservative|aggressive|flat (default: conservative)
 --tau                FM de-emphasis time constant in seconds (default: 0, i.e. none)
---calibrate-rssi     Run RSSI calibration mode (field or absolute)
---cal-freq           Frequency for calibration in Hz (defaults to channel frequency)
 ```
-
-## RSSI Calibration
-
-Three tiers:
-
-| Tier | Label in UI | CSV column | How |
-|------|-------------|------------|-----|
-| None (default) | dBFS | `peak_rssi_dBFS` | Raw probe values, no offset |
-| Field | ~dBm (field cal) | `peak_rssi_approx_dBm_(field_cal)` | `--calibrate-rssi field` — user provides estimated dBm from known source (e.g. NOAA WX) |
-| Absolute | dBm | `peak_rssi_dBm` | `--calibrate-rssi absolute` — signal generator + calibrated attenuator at antenna port |
-
-Calibration procedure:
-1. Tune to reference signal
-2. Average RSSI over 10 seconds (100 samples)
-3. User provides known dBm value
-4. Offset = reference_dBm - measured_dBFS
-5. Saved to `<channel_data_dir>/rssi_calibration.json`
 
 ## Dependencies
 

@@ -24,8 +24,6 @@ SQUELCH_RAMP = 240               # Ramp samples for squelch transitions
 
 # ── RSSI ────────────────────────────────────────────────
 RSSI_AVERAGE_LEN = 1000          # Moving average length for RSSI
-DEFAULT_RSSI_OFFSET = 0.0        # Calibration offset (dBFS → dBm)
-DEFAULT_RSSI_CALIBRATION_TIER = None  # None, "field", or "absolute"
 
 # ── DCS (Digital Coded Squelch) ─────────────────────────
 DCS_CODE = 0                     # Default DCS code: none (overridden by YAML/CLI)
@@ -144,7 +142,6 @@ class ResolvedPaths:
     data_root: str         # ~/.local/share/sdr-rx
     channel_data_dir: str  # data_root/<channel_id>
     audio_dir: str         # channel_data_dir/audio
-    calibration_file: str  # channel_data_dir/rssi_calibration.json
 
 
 def resolve_paths(data_dir_override=None, channel_id=None):
@@ -174,7 +171,6 @@ def resolve_paths(data_dir_override=None, channel_id=None):
         data_root=data_root,
         channel_data_dir=channel_data_dir,
         audio_dir=os.path.join(channel_data_dir, "audio"),
-        calibration_file=os.path.join(channel_data_dir, "rssi_calibration.json"),
     )
 
 

@@ -5,7 +5,6 @@ Generic NFM SDR monitor with configurable channel name, frequency,
 and DCS code loaded from YAML config file with CLI overrides.
 """
 
-import json
 import os
 import queue
 import signal
@@ -14,7 +13,6 @@ import threading
 import time
 
 import click
-import numpy as np
 import uvicorn
 import yaml
 
@@ -23,7 +21,6 @@ from config import (
     MAX_AUDIO_MB, WEB_HOST, WEB_PORT, TX_ENDING_TIMEOUT_S,
     DEFAULT_AUDIO_PRESET, FM_TAU,
     CHANNEL_NAME, DCS_CODE, DEFAULT_CHANNEL_ID,
-    DEFAULT_RSSI_OFFSET, DEFAULT_RSSI_CALIBRATION_TIER,
     CHANNEL_ID_RE,
     resolve_paths, resolve_channel_config, validate_channel_id,
 )
@@ -90,86 +87,6 @@ def _validate_channel_config(cfg):
     if mode not in ("advisory", "strict"):
         click.echo(f"Error: dcs_mode must be 'advisory' or 'strict', got: {mode}", err=True)
         sys.exit(1)
-
-
-def _load_calibration(paths, freq_hz, gain):
-    """Load RSSI calibration from file if it exists and matches current RF settings.
-
-    Returns (rssi_offset, rssi_calibration_tier).
-    """
-    if not os.path.isfile(paths.calibration_file):
-        return (DEFAULT_RSSI_OFFSET, DEFAULT_RSSI_CALIBRATION_TIER)
-    try:
-        with open(paths.calibration_file) as f:
-            cal = json.load(f)
-    except Exception as e:
-        click.echo(f"Warning: could not load calibration: {e}")
-        return (DEFAULT_RSSI_OFFSET, DEFAULT_RSSI_CALIBRATION_TIER)
-
-    # Validate RF settings match
-    cal_freq = cal.get("freq_hz")
-    cal_gain = cal.get("gain")
-    if cal_freq != freq_hz or cal_gain != gain:
-        click.echo(f"Warning: ignoring calibration (freq={cal_freq}, gain={cal_gain}) — "
-                    f"does not match current settings (freq={freq_hz}, gain={gain})")
-        return (DEFAULT_RSSI_OFFSET, DEFAULT_RSSI_CALIBRATION_TIER)
-
-    offset = cal.get("offset", DEFAULT_RSSI_OFFSET)
-    tier = cal.get("tier", DEFAULT_RSSI_CALIBRATION_TIER)
-    click.echo(f"Loaded RSSI calibration: offset={offset:.1f}, tier={tier}")
-    return (offset, tier)
-
-
-def _run_calibrate(freq, gain, tier, paths):
-    """Run RSSI calibration mode."""
-    from gr_engine import MonitorFlowgraph
-
-    click.echo(f"RSSI Calibration Mode (tier: {tier})")
-    click.echo(f"Frequency: {freq/1e6:.3f} MHz, Gain: {gain}")
-    click.echo("Measuring RSSI for 10 seconds (100 samples at 10 Hz)...")
-
-    fg = MonitorFlowgraph(freq=freq, gain=gain)
-    fg.start()
-    time.sleep(1)  # Let flowgraph settle
-
-    readings = []
-    for _ in range(100):
-        readings.append(fg.get_rssi())
-        time.sleep(0.1)
-
-    fg.stop()
-    fg.wait()
-
-    readings = np.array(readings)
-    mean_dbfs = float(np.mean(readings))
-    std_dbfs = float(np.std(readings))
-
-    click.echo(f"\nMeasured RSSI: {mean_dbfs:.1f} dBFS (std: {std_dbfs:.1f})")
-
-    ref_dbm = click.prompt("Enter reference signal level (dBm)", type=float)
-    offset = ref_dbm - mean_dbfs
-
-    click.echo(f"\nComputed offset: {offset:.1f} dB")
-    click.echo(f"  Measured dBFS:  {mean_dbfs:.1f}")
-    click.echo(f"  Reference dBm:  {ref_dbm:.1f}")
-    click.echo(f"  Offset:         {offset:.1f}")
-
-    if click.confirm("Save calibration?"):
-        os.makedirs(paths.channel_data_dir, exist_ok=True)
-        cal = {
-            "offset": offset,
-            "tier": tier,
-            "measured_dbfs": mean_dbfs,
-            "reference_dbm": ref_dbm,
-            "freq_hz": freq,
-            "gain": gain,
-            "timestamp": time.time(),
-        }
-        with open(paths.calibration_file, "w") as f:
-            json.dump(cal, f, indent=2)
-        click.echo(f"Calibration saved to {paths.calibration_file}")
-    else:
-        click.echo("Calibration not saved.")
 
 
 def _handle_init_channel(channel_id, paths):
@@ -244,10 +161,6 @@ def _handle_list_channels(paths):
               help="Voice audio processing preset.")
 @click.option("--tau", default=None, type=float,
               help="FM de-emphasis time constant (seconds). 0=none (LMR default), 75e-6=broadcast FM. Omit to use default.")
-@click.option("--calibrate-rssi", type=click.Choice(["field", "absolute"]),
-              default=None, help="Run RSSI calibration mode.")
-@click.option("--cal-freq", default=None, type=int,
-              help="Frequency for calibration (Hz). Defaults to channel frequency.")
 @click.option("--data-dir", default=None, type=str,
               help="Override data directory (default: ~/.local/share/sdr-rx).")
 @click.option("--list-channels", is_flag=True, default=False,
@@ -257,7 +170,7 @@ def _handle_list_channels(paths):
               help="Create a channel config from template and exit. Defaults to 'default'.")
 def main(config_file, channel_id_cli, freq, dcs_code, channel_name_cli, gain, squelch,
          record, max_audio_mb, port, host, tx_tail, audio_preset, tau,
-         calibrate_rssi, cal_freq, data_dir, list_channels, init_channel_id):
+         data_dir, list_channels, init_channel_id):
     """SDR Monitor — GNU Radio + Web Dashboard.
 
     \b
@@ -274,7 +187,6 @@ def main(config_file, channel_id_cli, freq, dcs_code, channel_name_cli, gain, sq
       python main.py --no-record              # monitor only, no recording
       python main.py --init-channel myradio   # create new channel config
       python main.py --list-channels          # show available channels
-      python main.py --calibrate-rssi field   # calibrate RSSI
     """
 
     # ── Short-circuit commands (no hardware needed) ──
@@ -339,14 +251,6 @@ def main(config_file, channel_id_cli, freq, dcs_code, channel_name_cli, gain, sq
     if record:
         os.makedirs(paths.audio_dir, exist_ok=True)
 
-    # Calibration mode
-    if calibrate_rssi:
-        _run_calibrate(cal_freq or ch_freq, gain, calibrate_rssi, paths)
-        return
-
-    # Load existing calibration
-    rssi_offset, rssi_calibration_tier = _load_calibration(paths, ch_freq, gain)
-
     # Apply tx-tail to config
     import config
     config.TX_ENDING_TIMEOUT_S = tx_tail
@@ -359,7 +263,6 @@ def main(config_file, channel_id_cli, freq, dcs_code, channel_name_cli, gain, sq
     click.echo(f"  Web: http://{host}:{port} | Audio: {audio_preset} preset | tau: {tau_display}")
     click.echo(f"  Data: {paths.channel_data_dir}")
 
-    # Import here to avoid GNU Radio init during calibration-only runs
     click.echo("Loading GNU Radio modules...")
     from gr_engine import MonitorFlowgraph
     from dcs_decoder import DCSDecoderBlock
@@ -396,8 +299,6 @@ def main(config_file, channel_id_cli, freq, dcs_code, channel_name_cli, gain, sq
         dcs_code=ch_dcs,
         dcs_mode=ch_dcs_mode,
         paths=paths,
-        rssi_offset=rssi_offset,
-        rssi_calibration_tier=rssi_calibration_tier,
     )
 
     web_app = create_app(telemetry_queue, app_core, flowgraph,
