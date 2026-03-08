@@ -18,6 +18,9 @@ from config import (
 )
 from recording import write_wav, apply_sox_filter, cleanup_audio
 
+# Max pending finalize jobs before applying backpressure
+_FINALIZE_QUEUE_MAX = 4
+
 
 class AppCore:
     """State machine that polls the GNU Radio flowgraph and orchestrates recording."""
@@ -30,8 +33,9 @@ class AppCore:
 
     def __init__(self, flowgraph, audio_tap, dcs_decoder, telemetry_queue,
                  record=True, max_audio_mb=500, channel_name="FRS Ch 1",
-                 dcs_code=0, dcs_mode="advisory", paths=None):
+                 dcs_code=0, dcs_mode="advisory", paths=None, *, channel_id):
         self._fg = flowgraph
+        self._channel_id = channel_id
         self._audio_tap = audio_tap
         self._dcs = dcs_decoder
         self._telem_q = telemetry_queue
@@ -61,6 +65,22 @@ class AppCore:
         self._tx_with_dcs_match = 0
         self._tx_without_dcs_match = 0
         self._tx_log = deque(maxlen=200)
+        self._tx_seq = 0
+
+        # Background finalization — WAV/sox/cleanup off the poll thread.
+        # Single worker thread with bounded queue for backpressure.
+        self._finalize_lock = threading.Lock()
+        self._finalize_queue = queue.Queue(maxsize=_FINALIZE_QUEUE_MAX)
+        self._finalize_canceled = set()  # job IDs canceled by delete_tx
+        self._finalize_thread = None
+        self._finalize_shutdown = False
+
+        # Finalize counters (observable via telemetry)
+        self._finalize_pending = 0
+        self._finalize_written = 0
+        self._finalize_failed = 0
+        self._finalize_canceled_count = 0
+        self._finalize_dropped = 0
 
         os.makedirs(self._channel_data_dir, exist_ok=True)
         if record:
@@ -72,6 +92,11 @@ class AppCore:
         self._running = True
         self._thread = threading.Thread(target=self._poll_loop, daemon=True)
         self._thread.start()
+        self._finalize_thread = threading.Thread(
+            target=self._finalize_worker, daemon=True,
+            name=f"finalize-{self._channel_id}",
+        )
+        self._finalize_thread.start()
 
     def stop(self):
         self._running = False
@@ -83,6 +108,19 @@ class AppCore:
                 self._finalize_tx()
         except Exception as e:
             print(f"[AppCore] finalize error during shutdown: {e}")
+        # Drain the finalize worker without blocking forever if the queue is full.
+        self._finalize_shutdown = True
+        deadline = time.monotonic() + 5.0
+        while True:
+            try:
+                self._finalize_queue.put(None, timeout=0.1)  # sentinel
+                break
+            except queue.Full:
+                if time.monotonic() >= deadline:
+                    print("[AppCore] finalize queue full during shutdown; worker will exit when queue drains")
+                    break
+        if self._finalize_thread:
+            self._finalize_thread.join(timeout=15)
 
     def _poll_loop(self):
         interval = 1.0 / POLL_RATE_HZ
@@ -98,8 +136,8 @@ class AppCore:
                 time.sleep(sleep_time)
 
     def _poll(self):
-        rssi = self._fg.get_rssi()
-        squelch_open = self._fg.get_squelch_open()
+        rssi = self._fg.get_rssi(self._channel_id)
+        squelch_open = self._fg.get_squelch_open(self._channel_id)
         dcs_detected = self._dcs.get_detected() if self._dcs else False
         dcs_polarity = self._dcs.get_polarity() if self._dcs else "unknown"
 
@@ -169,19 +207,27 @@ class AppCore:
             self._audio_tap.start_recording()
 
     def _finalize_tx(self):
-        """Finalize current transmission: save recording, log CSV."""
+        """Finalize current transmission: stop recording, log, enqueue WAV write.
+
+        Synchronous (on poll thread): stop_recording, counters, TX log, CSV.
+        Asynchronous (finalize worker): write_wav, apply_sox_filter, cleanup_audio.
+        This keeps the poll loop responsive so new transmissions are detected immediately.
+        """
         filename = None
+        raw_audio = None
+        job_id = None
 
         if self._audio_tap and self._audio_tap.is_recording():
             raw_audio = self._audio_tap.stop_recording()
             duration = len(raw_audio) / (2 * 8000)  # 16-bit mono
 
             if self._record and duration >= 0.5 and self._tx_start_time:
-                ts = self._tx_start_time.strftime("%Y%m%d_%H%M%S")
-                filename = os.path.join(self._audio_dir, f"{self._file_prefix}_{ts}.wav")
-                write_wav(filename, raw_audio)
-                apply_sox_filter(filename)
-                cleanup_audio(self._max_audio_mb, self._audio_dir)
+                self._tx_seq += 1
+                ts = self._tx_start_time.strftime("%Y%m%d_%H%M%S_%f")
+                job_id = f"{ts}_{self._tx_seq}"
+                filename = os.path.join(
+                    self._audio_dir, f"{self._file_prefix}_{job_id}.wav",
+                )
         else:
             duration = 0.0
 
@@ -201,6 +247,7 @@ class AppCore:
             "dcs_confirmed": self._tx_dcs_confirmed,
             "dcs_polarity": self._tx_dcs_polarity,
             "filename": filename,
+            "_job_id": job_id,
         }
 
         # In strict mode, flag non-matching transmissions
@@ -212,10 +259,97 @@ class AppCore:
         # CSV logging
         self._log_csv(entry)
 
+        # Enqueue background WAV write
+        if filename and raw_audio and job_id:
+            job = (job_id, filename, raw_audio)
+            try:
+                self._finalize_queue.put_nowait(job)
+                with self._finalize_lock:
+                    self._finalize_pending += 1
+            except queue.Full:
+                # Backpressure: queue full, skip sox and write raw WAV inline
+                with self._finalize_lock:
+                    self._finalize_dropped += 1
+                print(f"[AppCore] finalize backlog full, writing raw WAV inline: {os.path.basename(filename)}")
+                try:
+                    write_wav(filename, raw_audio)
+                    # If user deleted while inline write was in progress, remove the file.
+                    with self._finalize_lock:
+                        canceled = job_id in self._finalize_canceled
+                        if canceled:
+                            self._finalize_canceled.discard(job_id)
+                            self._finalize_canceled_count += 1
+                    if canceled:
+                        try:
+                            os.remove(filename)
+                        except OSError:
+                            pass
+                except Exception as e:
+                    print(f"[AppCore] inline WAV write error: {e}")
+
         # Reset
         self._squelch_open_count = 0
         self._squelch_closed_count = 0
         self._tx_start_time = None
+
+    def _finalize_worker(self):
+        """Background worker: dequeues (job_id, filename, raw_audio) jobs, writes WAV + sox."""
+        while True:
+            job = self._finalize_queue.get()
+            if job is None:
+                break  # shutdown sentinel
+
+            job_id, filename, raw_audio = job
+
+            # Check cancellation before writing
+            with self._finalize_lock:
+                if job_id in self._finalize_canceled:
+                    self._finalize_canceled.discard(job_id)
+                    self._finalize_canceled_count += 1
+                    self._finalize_pending = max(0, self._finalize_pending - 1)
+                    print(f"[AppCore] finalize canceled (pre-write): {os.path.basename(filename)}")
+                    continue
+
+            try:
+                write_wav(filename, raw_audio)
+
+                # Check cancellation after write but before sox
+                with self._finalize_lock:
+                    if job_id in self._finalize_canceled:
+                        self._finalize_canceled.discard(job_id)
+                        self._finalize_canceled_count += 1
+                        self._finalize_pending = max(0, self._finalize_pending - 1)
+                        # Clean up the file we just wrote
+                        try:
+                            os.remove(filename)
+                        except OSError:
+                            pass
+                        print(f"[AppCore] finalize canceled (post-write): {os.path.basename(filename)}")
+                        continue
+
+                # Skip sox when backlog is building up — write raw WAV to keep up
+                if self._finalize_queue.qsize() >= _FINALIZE_QUEUE_MAX - 1:
+                    print(f"[AppCore] skipping sox (backlog): {os.path.basename(filename)}")
+                else:
+                    apply_sox_filter(filename)
+
+                cleanup_audio(self._max_audio_mb, self._audio_dir)
+
+                with self._finalize_lock:
+                    self._finalize_written += 1
+                    self._finalize_pending = max(0, self._finalize_pending - 1)
+            except Exception as e:
+                with self._finalize_lock:
+                    self._finalize_failed += 1
+                    self._finalize_pending = max(0, self._finalize_pending - 1)
+                print(f"[AppCore] finalize error: {e}")
+
+    def cancel_finalize(self, job_id):
+        """Mark a job ID as canceled so the finalize writer skips/removes it."""
+        if not job_id:
+            return
+        with self._finalize_lock:
+            self._finalize_canceled.add(job_id)
 
     def _log_csv(self, entry):
         csv_path = os.path.join(self._channel_data_dir, f"{datetime.now().strftime('%Y%m%d')}.csv")
@@ -302,7 +436,7 @@ class AppCore:
             "rssi": round(rssi, 1),
             "rssi_unit": "dBFS",
             "squelch_open": squelch_open,
-            "squelch_threshold": self._fg.get_squelch_threshold(),
+            "squelch_threshold": self._fg.get_squelch_threshold(self._channel_id),
             "dcs_detected": dcs_detected,
             "dcs_polarity": dcs_polarity,
             "state": self._state,
@@ -314,6 +448,7 @@ class AppCore:
             "recording_duration": round(rec_duration, 1),
             "gain": self._fg.get_gain(),
             "timestamp": time.time(),
+            "finalize_pending": self._finalize_pending,
         }
 
         try:
@@ -346,8 +481,9 @@ class AppCore:
         else:
             self._tx_without_dcs_match = max(0, self._tx_without_dcs_match - 1)
 
-        # Delete WAV file if it exists
+        # Cancel pending finalize and/or delete existing WAV file
         if entry.get("filename"):
+            self.cancel_finalize(entry.get("_job_id"))
             try:
                 if os.path.isfile(entry["filename"]):
                     os.remove(entry["filename"])

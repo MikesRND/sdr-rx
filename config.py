@@ -9,13 +9,29 @@ import sys
 # ── Application Identity ──────────────────────────────
 APP_NAME = "sdr-rx"
 
-# ── RF / SDR ────────────────────────────────────────────
-FREQ_HZ = 462_562_500             # Default frequency: FRS Ch 1 (overridden by YAML/CLI)
-SDR_SAMPLE_RATE = 240_000         # RTL-SDR capture rate (Hz)
-CHANNEL_RATE = 24_000             # After decimation (÷10)
-AUDIO_RATE = 8_000                # After NBFM demod (÷3)
-DECIMATION = SDR_SAMPLE_RATE // CHANNEL_RATE  # 10
-RF_GAIN = 40                     # Default tuner gain (dB)
+
+# ── Receiver (physical SDR hardware) ──────────────────
+@dataclasses.dataclass(frozen=True)
+class Receiver:
+    """Physical SDR hardware properties."""
+    device_index: int = 0
+    sample_rate: int = 240_000         # ADC capture rate (Hz)
+    max_channels: int = 2              # Max simultaneous channels
+    if_gain: int = 20                  # IF gain (dB) — R820T2 hardware stage
+    bb_gain: int = 20                  # Baseband gain (dB) — R820T2 hardware stage
+
+
+DEFAULT_RECEIVER = Receiver()
+
+
+# ── DSP Chain (application design choices) ────────────
+CHANNEL_RATE = 24_000             # After decimation (Hz)
+AUDIO_RATE = 8_000                # After NBFM demod (Hz)
+DECIMATION = DEFAULT_RECEIVER.sample_rate // CHANNEL_RATE  # 10
+
+# ── RF Defaults ────────────────────────────────────────
+FREQ_HZ = 462_562_500             # Default frequency: FRS Ch 1 (template default)
+RF_GAIN = 40                     # Default tuner gain (dB) — application default
 
 # ── Squelch ─────────────────────────────────────────────
 SQUELCH_THRESHOLD_DB = -45.0     # RF power squelch threshold (dB)
@@ -174,45 +190,43 @@ def resolve_paths(data_dir_override=None, channel_id=None):
     )
 
 
-def resolve_channel_config(config_path=None, channel_id=None, channels_dir=None):
-    """Resolve which channel YAML file to load and determine the channel ID.
+def resolve_channel_configs(channel_ids, channels_dir, max_channels=None):
+    """Resolve multiple channel IDs to (id, path) pairs.
 
-    Returns (config_file_path_or_None, channel_id).
-    Exits on validation errors or missing explicit files.
+    Validates: no duplicates, all IDs valid, all files exist,
+    count within max_channels.
+    Calls sys.exit on any error.
+    Returns list of (channel_id, config_path) tuples.
     """
-    if config_path and channel_id:
-        print("Error: --config and --channel cannot be used together.", file=sys.stderr)
+    if max_channels is None:
+        max_channels = DEFAULT_RECEIVER.max_channels
+
+    if len(channel_ids) < 1:
+        print("Error: at least one -c/--channel is required.", file=sys.stderr)
+        print("  Tip: python main.py -c <channel_id>", file=sys.stderr)
+        print("  Run 'python main.py --list-channels' to see available channels.", file=sys.stderr)
         sys.exit(1)
 
-    if channel_id:
-        validate_channel_id(channel_id)
-        if channels_dir:
-            candidate = os.path.join(channels_dir, f"{channel_id}.yaml")
-            if not os.path.isfile(candidate):
-                print(f"Error: channel '{channel_id}' not found at {candidate}", file=sys.stderr)
-                sys.exit(1)
-            return (candidate, channel_id)
-        return (None, channel_id)
+    if len(channel_ids) > max_channels:
+        print(f"Error: too many channels ({len(channel_ids)}). "
+              f"Max {max_channels} per receiver.", file=sys.stderr)
+        sys.exit(1)
 
-    if config_path:
-        if not os.path.isfile(config_path):
-            print(f"Error: config file not found: {config_path}", file=sys.stderr)
+    # Check duplicates
+    seen = set()
+    for cid in channel_ids:
+        if cid in seen:
+            print(f"Error: duplicate channel ID '{cid}'.", file=sys.stderr)
             sys.exit(1)
-        try:
-            with open(config_path) as f:
-                f.read(1)
-        except PermissionError:
-            print(f"Error: cannot read config file: {config_path}", file=sys.stderr)
+        seen.add(cid)
+
+    result = []
+    for cid in channel_ids:
+        validate_channel_id(cid)
+        path = os.path.join(channels_dir, f"{cid}.yaml")
+        if not os.path.isfile(path):
+            print(f"Error: channel '{cid}' not found at {path}", file=sys.stderr)
             sys.exit(1)
-        stem = os.path.splitext(os.path.basename(config_path))[0]
-        cid = validate_channel_id(stem, source="config_stem")
-        return (config_path, cid)
+        result.append((cid, path))
 
-    # Fallback: try default.yaml in channels dir
-    if channels_dir:
-        default = os.path.join(channels_dir, "default.yaml")
-        if os.path.isfile(default):
-            return (default, "default")
-
-    # No config found — use built-in defaults
-    return (None, DEFAULT_CHANNEL_ID)
+    return result

@@ -2,40 +2,94 @@
 
 ## Overview
 
-Generic NFM SDR monitor using GNU Radio + FastAPI web dashboard. Channel name, frequency, and DCS code are configured via channel YAML configs in `~/.config/sdr-rx/channels/` with CLI overrides. The built-in default monitors FRS Channel 1 (462.5625 MHz, no DCS).
+Multi-channel NFM SDR monitor using GNU Radio + FastAPI web dashboard. One RTL-SDR dongle feeds up to 2 simultaneous demodulation channels, each with independent squelch, recording, and state machine. Channels are configured via YAML configs in `~/.config/sdr-rx/channels/`.
 
 Key features:
-- RF power squelch on raw IQ samples (not audio energy)
-- DCS/DPL Golay(23,12) tone decoding with dual-polarity detection (configurable code)
-- RSSI signal level (dBFS)
-- Web dashboard with live telemetry, audio streaming, and recording management
-- DCS match rate tracking and mismatch flagging
+- Multi-channel monitoring (up to 2 channels per receiver, configurable)
+- RF power squelch on raw IQ samples (not audio energy), independent per channel
+- DCS/DPL Golay(23,12) tone decoding with dual-polarity detection (per channel)
+- RSSI signal level (dBFS) per channel
+- Web dashboard with channel selector, live telemetry, audio streaming, and recording management
+- DCS match rate tracking and mismatch flagging per channel
 
 ## Architecture
 
 ```mermaid
 flowchart LR
     SDR[RTL-SDR<br/>Blog V3]
-    GR[GNU Radio<br/>Flowgraph]
-    APP[App Core<br/>State Machine]
+    GR[ReceiverFlowgraph<br/>N demod chains]
+    APP1[AppCore #1<br/>State Machine]
+    APP2[AppCore #2<br/>State Machine]
     WEB[FastAPI<br/>WebSocket]
     UI[Browser<br/>Dashboard]
 
     SDR -->|IQ samples<br/>240 kHz| GR
-    GR -->|squelch state<br/>RSSI probe<br/>DCS decode<br/>audio chunks| APP
-    APP -->|telemetry queue| WEB
-    WEB -->|WebSocket<br/>10 Hz telemetry<br/>PCM audio| UI
+    GR -->|squelch/RSSI/DCS<br/>audio per channel| APP1
+    GR -->|squelch/RSSI/DCS<br/>audio per channel| APP2
+    APP1 -->|telemetry queue| WEB
+    APP2 -->|telemetry queue| WEB
+    WEB -->|WebSocket per ch<br/>10 Hz telemetry<br/>PCM audio| UI
 ```
 
 ## GNU Radio Flowgraph
 
+One `ReceiverFlowgraph(gr.top_block)` with a single RTL-SDR source and N parallel demod chains. Center frequency is computed as the midpoint of all channel frequencies. Each channel uses a `freq_xlating_fir_filter_ccc` with its frequency offset from center.
+
+```mermaid
+flowchart LR
+    SDR["RTL-SDR<br/>240 kHz IQ<br/>center = midpoint"]
+
+    XF1["freq_xlating_fir #1<br/>offset=-50kHz"]
+    XF2["freq_xlating_fir #2<br/>offset=+50kHz"]
+
+    SQ1["squelch #1"]
+    SQ2["squelch #2"]
+
+    NBFM1["nbfm #1"]
+    NBFM2["nbfm #2"]
+
+    VOICE1["voice #1"]
+    VOICE2["voice #2"]
+
+    TAP1["audio_tap_1"]
+    TAP2["audio_tap_2"]
+
+    DCS1["dcs_decoder_1"]
+    DCS2["dcs_decoder_2"]
+
+    SDR --> XF1 --> SQ1 --> NBFM1
+    SDR --> XF2 --> SQ2 --> NBFM2
+
+    NBFM1 --> VOICE1 --> TAP1
+    NBFM1 --> DCS1
+
+    NBFM2 --> VOICE2 --> TAP2
+    NBFM2 --> DCS2
+
+    style SDR fill:#2a4a7f,stroke:#4a8af4,color:#fff
+    style XF1 fill:#1e3a5f,stroke:#4a8af4,color:#fff
+    style XF2 fill:#1e3a5f,stroke:#4a8af4,color:#fff
+    style SQ1 fill:#5a2a2a,stroke:#ff4444,color:#fff
+    style SQ2 fill:#5a2a2a,stroke:#ff4444,color:#fff
+    style NBFM1 fill:#1e3a5f,stroke:#4a8af4,color:#fff
+    style NBFM2 fill:#1e3a5f,stroke:#4a8af4,color:#fff
+    style VOICE1 fill:#3a1e3a,stroke:#ff66ff,color:#fff
+    style VOICE2 fill:#3a1e3a,stroke:#ff66ff,color:#fff
+    style TAP1 fill:#2a5a2a,stroke:#44ff44,color:#fff
+    style TAP2 fill:#2a5a2a,stroke:#44ff44,color:#fff
+    style DCS1 fill:#4a2a5a,stroke:#aa66ff,color:#fff
+    style DCS2 fill:#4a2a5a,stroke:#aa66ff,color:#fff
+```
+
+Per-channel block chain (each channel gets its own independent set):
+
 ```mermaid
 flowchart TD
-    SRC["<b>osmosdr.source</b><br/>RTL-SDR @ 240 kHz<br/>gain=40"]
+    SRC["<b>osmosdr.source</b><br/>RTL-SDR @ 240 kHz<br/>center = midpoint"]
 
-    CHAN["<b>freq_xlating_fir_filter_ccc</b><br/>LPF cutoff 7.5 kHz<br/>decimate ÷10 → 24 kHz"]
+    CHAN["<b>freq_xlating_fir_filter_ccc</b><br/>LPF cutoff 7.5 kHz<br/>offset = ch.freq - center<br/>decimate ÷10 → 24 kHz"]
 
-    SQ["<b>pwr_squelch_cc</b><br/>threshold=-45 dB<br/>alpha=0.001, ramp=240<br/>gate=False"]
+    SQ["<b>pwr_squelch_cc</b><br/>per-channel threshold<br/>alpha=0.001, ramp=240<br/>gate=False"]
 
     NBFM["<b>nbfm_rx</b><br/>quad=24k, audio=8k<br/>max_dev=5 kHz, tau=configurable"]
 
@@ -86,6 +140,12 @@ flowchart TD
     style LOG fill:#3a3a1e,stroke:#ffaa44,color:#fff
     style PROBE fill:#3a3a1e,stroke:#ffaa44,color:#fff
 ```
+
+### Bandwidth Validation
+
+All channel frequencies must fit within the receiver bandwidth:
+`max(freqs) - min(freqs) < receiver.sample_rate - CHANNEL_RATE`
+(240k - 24k = 216 kHz usable span)
 
 ### Sample Rates
 
@@ -185,7 +245,7 @@ stateDiagram-v2
 | **IDLE** | — | Poll squelch + RSSI at 10 Hz | — |
 | **CARRIER_DETECTED** | Reset DCS decoder, start recording (copy ring buffer as pre-trigger) | Wait up to 500ms for DCS | — |
 | **TX_ACTIVE** | — | Record audio, track peak RSSI, check DCS (can retroactively confirm) | — |
-| **TX_ENDING** | — | Count continuous squelch-closed polls | Finalize: save WAV, sox filter (HPF + mono→stereo), log CSV |
+| **TX_ENDING** | — | Count continuous squelch-closed polls | Finalize: stop recording + log CSV (sync), enqueue WAV write + sox filter (async worker) |
 
 ### Timing
 
@@ -208,21 +268,25 @@ The ring buffer fills continuously regardless of recording state. When a recordi
 flowchart TD
     subgraph T1["Thread 1: GNU Radio"]
         GR_SCHED["GR Scheduler<br/><code>top_block.start()</code>"]
-        GR_BLOCKS["Signal processing<br/>AudioTapBlock callbacks<br/>DCSDecoder callbacks"]
+        GR_BLOCKS["N demod chains<br/>AudioTapBlock callbacks<br/>DCSDecoder callbacks"]
         GR_SCHED --> GR_BLOCKS
     end
 
-    subgraph T2["Thread 2: App Core"]
-        POLL["10 Hz poll loop"]
+    subgraph T2["Threads 2..N+1: App Cores"]
+        POLL["10 Hz poll loop (per channel)"]
         SM["State machine"]
-        REC["Recording orchestration"]
+        REC["Recording orchestration<br/>(stop_recording + log)"]
         POLL --> SM --> REC
     end
 
-    subgraph T3["Thread 3: FastAPI"]
+    subgraph T2B["Threads N+2..2N+1: Finalize Workers"]
+        FW["WAV write + sox + cleanup<br/>(one worker per channel)"]
+    end
+
+    subgraph T3["Thread 2N+2: FastAPI"]
         UV["uvicorn asyncio loop"]
-        TELEM_BC["Telemetry broadcaster"]
-        WS_HANDLERS["WebSocket handlers"]
+        TELEM_BC["Telemetry broadcaster<br/>(one task per channel)"]
+        WS_HANDLERS["Per-channel WS handlers"]
         UV --> TELEM_BC
         UV --> WS_HANDLERS
     end
@@ -234,9 +298,10 @@ flowchart TD
         STARTUP --> SIG --> SHUTDOWN
     end
 
-    Q["queue.Queue<br/>(telemetry)"]
-    LOOP_REF["loop ref<br/>(audio broadcast)"]
+    Q["queue.Queue per channel<br/>(telemetry)"]
+    LOOP_REF["loop ref<br/>(per-channel audio broadcast)"]
 
+    T2 -->|bounded queue<br/>(job_id, filename, audio)| T2B
     T2 -->|put| Q
     Q -->|run_in_executor get| T3
     T1 -->|call_soon_threadsafe| LOOP_REF
@@ -244,37 +309,44 @@ flowchart TD
 
     style T1 fill:#1e3a5f,stroke:#4a8af4,color:#fff
     style T2 fill:#2a5a2a,stroke:#44ff44,color:#fff
+    style T2B fill:#2a4a2a,stroke:#44cc44,color:#fff
     style T3 fill:#5a2a2a,stroke:#ff4444,color:#fff
     style MAIN fill:#3a3a1e,stroke:#ffaa44,color:#fff
 ```
 
 ### Cross-Thread Communication
 
-- **Telemetry (T2 → T3):** `queue.Queue(maxsize=50)`. App core pushes dicts, FastAPI background task does blocking `queue.get()` via `run_in_executor`, then broadcasts to WebSocket clients. Sentinel `None` signals shutdown.
-- **Live audio (T1 → T3):** `AudioTapBlock` callback invokes `broadcast_audio()` which uses `loop.call_soon_threadsafe()` to schedule async sends on the FastAPI event loop. Loop reference captured at FastAPI startup to avoid `get_event_loop()` errors from non-async threads. **Client gating:** `broadcast_audio()` checks `audio_client_count` (a simple int, thread-safe for reads via GIL) and returns immediately when zero — avoiding event loop scheduling, coroutine creation, and lock acquisition when nobody is listening. The count is maintained on WebSocket connect/disconnect and dead client cleanup.
-- **Shutdown:** Main thread sets `shutdown_event`, app core stops (saves in-progress recording), sentinel pushed to queue, uvicorn `should_exit` set, flowgraph stopped. Second SIGINT forces `os._exit(1)`.
+- **Telemetry (T2..N → T3):** One `queue.Queue(maxsize=50)` per channel. Each AppCore pushes dicts to its own queue. FastAPI runs one background broadcaster task per channel that does blocking `queue.get()` via `run_in_executor`, then broadcasts to that channel's WebSocket clients. Sentinel `None` signals shutdown.
+- **Live audio (T1 → T3):** Per-channel `AudioTapBlock` callback invokes a per-channel `broadcast_audio()` closure which uses `loop.call_soon_threadsafe()` to schedule async sends on the FastAPI event loop. Loop reference captured at FastAPI startup. **Client gating:** each `broadcast_audio()` checks its channel's `audio_client_count` and returns immediately when zero.
+- **Recording finalize (T2 → T2B):** Per-channel bounded `queue.Queue(maxsize=4)`. AppCore enqueues `(job_id, filename, raw_audio)` tuples after `stop_recording()`. Finalize worker dequeues and writes WAV + sox. Backpressure: when full, poll thread writes raw WAV inline (no sox). Delete cancellation via job ID set checked pre-write and post-write.
+- **Shutdown:** Main thread sets `shutdown_event`, all app cores stop (saving in-progress recordings, draining finalize workers), sentinel `None` pushed to each telemetry queue, uvicorn `should_exit` set, flowgraph stopped. Second SIGINT forces `os._exit(1)`.
 
 ## Web Frontend
 
 ### Endpoints
 
+All data routes are per-channel, keyed by `{ch}` (channel ID).
+
 | Method | Path | Description |
 |--------|------|-------------|
 | GET | `/` | Dashboard HTML |
-| WS | `/ws` | Telemetry at 10 Hz (RSSI, squelch, DCS, state, TX count) |
-| WS | `/audio/live` | Live PCM audio (4-byte seq + 8 kHz s16le mono chunks) |
-| GET | `/api/transmissions` | JSON transmission log |
-| DELETE | `/api/transmissions/{index}` | Delete a transmission entry and its WAV file |
-| GET | `/api/channel` | Channel info (name, freq, DCS code, DCS mode) |
-| GET | `/api/config` | Current squelch threshold + gain |
-| PUT | `/api/config` | Update squelch/gain at runtime |
-| GET | `/audio/<filename>` | Download recorded WAV file |
+| GET | `/api/channels` | List all channels `[{id, name, freq_hz, dcs_code, dcs_mode}, ...]` |
+| GET | `/api/channels/{ch}` | Single channel info |
+| GET | `/api/channels/{ch}/config` | Per-channel squelch + shared gain (read-only, for slider sync) |
+| GET | `/api/channels/{ch}/transmissions` | Per-channel TX log |
+| DELETE | `/api/channels/{ch}/transmissions/{idx}` | Per-channel delete |
+| WS | `/ws/{ch}` | Per-channel telemetry (accepts `squelch_threshold` and `gain` config writes) |
+| WS | `/audio/{ch}/live` | Per-channel live PCM audio (4-byte seq + 8 kHz s16le mono chunks) |
+| GET | `/audio/{ch}/{filename}` | Per-channel WAV download |
+
+Config writes (squelch threshold, gain) are sent as JSON over the telemetry WebSocket. `squelch_threshold` is per-channel; `gain` is shared (one tuner). `GET /api/channels/{ch}/config` is read-only, used for initial slider sync on page load or channel switch.
 
 ### Dashboard
 
 Vanilla HTML/CSS/JS, no frameworks. Dark theme with CSS grid layout. Responsive design for mobile.
 
 Components:
+- **Channel selector** (tab bar between header and main grid, one tab per channel)
 - Status bar with LED indicators (squelch, DCS, recording, connection)
 - Signal level meter (color-coded bar with threshold marker)
 - Numeric RSSI display (dBFS)
@@ -282,6 +354,8 @@ Components:
 - Live audio button (Web Audio API with jitter buffer)
 - Transmission log table (scrollable, newest first, with play/download/delete per row)
 - Log persistence: today's CSV is reloaded on startup
+
+Channel switching reconnects telemetry and audio WebSockets to the new channel's endpoints, refreshes TX log and slider positions, and updates channel info (name, freq, DCS).
 
 ### Live Audio
 
@@ -297,35 +371,34 @@ Client-side architecture:
 
 ```
 sdr-rx/
-├── main.py              # CLI entry point (click), YAML loading, thread coordination
-├── gr_engine.py         # MonitorFlowgraph(gr.top_block)
+├── main.py              # CLI entry point, multi-channel orchestration, ChannelStack
+├── gr_engine.py         # ReceiverFlowgraph(gr.top_block), ChannelConfig
 ├── dcs_decoder.py       # DCSDecoderBlock — configurable DCS Golay decoder
 ├── audio_tap.py         # AudioTapBlock — ring buffer + recording
-├── app_core.py          # State machine, CSV logging
-├── web_server.py        # FastAPI, WebSocket handlers, /api/channel endpoint
-├── config.py            # Default constants, ResolvedPaths, path resolution, sanitize_name()
+├── app_core.py          # State machine, CSV logging, finalize worker (one instance per channel)
+├── web_server.py        # FastAPI, per-channel WebSocket/REST endpoints
+├── config.py            # Receiver dataclass, constants, path resolution
 ├── recording.py         # WAV writing, sox filter (HPF + mono→stereo), disk cleanup
+├── test_dual_channel.py # Smoke tests (no hardware needed)
+├── test_finalize.py     # Finalize regression tests (delete race, backpressure, shutdown)
 ├── requirements.txt     # Python dependencies (includes pyyaml)
 ├── DESIGN.md            # This file
 ├── examples/
 │   └── channel_template.yaml  # Template for --init-channel
 └── static/
-    ├── index.html       # Dashboard page (dynamically populated)
-    ├── app.js           # WebSocket client, Web Audio, channel config fetch
-    └── style.css        # Dark theme, responsive
+    ├── index.html       # Dashboard page with channel selector
+    ├── app.js           # Multi-channel WebSocket client, channel switching
+    └── style.css        # Dark theme, responsive, channel tab styles
 ```
 
 ## CLI Options
 
 ```
---config             Path to channel YAML config file (no default)
---channel            Select channel by ID from ~/.config/sdr-rx/channels/
+--channel, -c        Channel ID (repeatable, required in run mode).
+                     Loads from ~/.config/sdr-rx/channels/<id>.yaml.
 --data-dir           Override data directory
 --list-channels      List available channel configs and exit
 --init-channel       Create a channel config from template and exit
---freq               Override channel frequency in Hz
---dcs-code           Override DCS code (octal digits as decimal, e.g. 565)
---name               Override channel name
 --gain, -g           RTL-SDR tuner gain in dB (default: 40)
 --squelch, -s        RF power squelch threshold in dB (default: -45.0)
 --record / --no-record, -r/-R   Record transmissions to WAV (default: on)
@@ -335,6 +408,15 @@ sdr-rx/
 --tx-tail            Seconds of squelch-closed before ending TX (default: 2.0)
 --audio-preset       Voice processing preset: conservative|aggressive|flat (default: conservative)
 --tau                FM de-emphasis time constant in seconds (default: 0, i.e. none)
+```
+
+Examples:
+```
+python main.py -c my_channel                    # monitor one channel
+python main.py -c ch1 -c ch2                    # monitor two channels
+python main.py -c ch1 -c ch2 -g 30 -s -25      # custom gain and squelch
+python main.py --init-channel myradio           # create new channel config
+python main.py --list-channels                  # show available channels
 ```
 
 ## Dependencies

@@ -1,4 +1,4 @@
-"""FastAPI web server with WebSocket telemetry and live audio streaming."""
+"""FastAPI web server with multi-channel WebSocket telemetry and live audio streaming."""
 
 import asyncio
 import json
@@ -18,43 +18,99 @@ STATIC_DIR = Path(__file__).parent / "static"
 
 
 class _ClientSets:
-    """Container to avoid Python closure scoping issues with mutable sets."""
+    """Container for WebSocket client sets for one channel."""
     def __init__(self):
         self.telemetry = set()
         self.audio = set()
         self.telem_lock = asyncio.Lock()
         self.audio_lock = asyncio.Lock()
-        self.loop = None  # event loop ref, set at startup
         self.audio_client_count = 0  # thread-safe via GIL for simple int reads
 
 
-def create_app(telemetry_queue, app_core, flowgraph, channel_info=None, paths=None):
-    """Create and configure the FastAPI application."""
+def create_app(channel_stacks, flowgraph):
+    """Create and configure the FastAPI application for multi-channel monitoring."""
 
-    if channel_info is None:
-        channel_info = {"name": "FRS Ch 1", "freq_hz": 462_562_500, "dcs_code": 0, "dcs_mode": "advisory"}
-
-    audio_dir = paths.audio_dir if paths else "audio"
-
-    app = FastAPI(title=channel_info["name"])
+    app = FastAPI(title="SDR Monitor")
     app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 
-    clients = _ClientSets()
+    # Per-channel client sets
+    clients = {ch_id: _ClientSets() for ch_id in channel_stacks}
+    loop_ref = [None]  # mutable container for event loop reference
+
+    def _get_stack(ch):
+        """Look up channel stack, return None if not found."""
+        return channel_stacks.get(ch)
+
+    # ── Dashboard ─────────────────────────────────────────
 
     @app.get("/", response_class=HTMLResponse)
     async def dashboard():
         index_path = STATIC_DIR / "index.html"
         return index_path.read_text()
 
-    @app.get("/api/channel")
-    async def get_channel():
-        return JSONResponse(content=channel_info)
+    # ── Channel listing ───────────────────────────────────
 
-    @app.websocket("/ws")
-    async def telemetry_ws(websocket: WebSocket):
+    @app.get("/api/channels")
+    async def get_channels():
+        result = []
+        for ch_id, stack in channel_stacks.items():
+            info = dict(stack.channel_info)
+            info["id"] = ch_id
+            result.append(info)
+        return JSONResponse(content=result)
+
+    @app.get("/api/channels/{ch}")
+    async def get_channel(ch: str):
+        stack = _get_stack(ch)
+        if not stack:
+            return JSONResponse(status_code=404, content={"error": "channel not found"})
+        info = dict(stack.channel_info)
+        info["id"] = ch
+        return JSONResponse(content=info)
+
+    # ── Per-channel config (read-only) ────────────────────
+
+    @app.get("/api/channels/{ch}/config")
+    async def get_config(ch: str):
+        stack = _get_stack(ch)
+        if not stack:
+            return JSONResponse(status_code=404, content={"error": "channel not found"})
+        return JSONResponse(content={
+            "squelch_threshold": flowgraph.get_squelch_threshold(ch),
+            "gain": flowgraph.get_gain(),
+        })
+
+    # ── Per-channel transmissions ─────────────────────────
+
+    @app.get("/api/channels/{ch}/transmissions")
+    async def get_transmissions(ch: str):
+        stack = _get_stack(ch)
+        if not stack:
+            return JSONResponse(status_code=404, content={"error": "channel not found"})
+        log = stack.app_core.get_tx_log()
+        return JSONResponse(content=log)
+
+    @app.delete("/api/channels/{ch}/transmissions/{index}")
+    async def delete_transmission(ch: str, index: int):
+        stack = _get_stack(ch)
+        if not stack:
+            return JSONResponse(status_code=404, content={"error": "channel not found"})
+        result = stack.app_core.delete_tx(index)
+        if result:
+            return JSONResponse(content={"status": "ok"})
+        return JSONResponse(status_code=404, content={"error": "not found"})
+
+    # ── Per-channel telemetry WebSocket ───────────────────
+
+    @app.websocket("/ws/{ch}")
+    async def telemetry_ws(websocket: WebSocket, ch: str):
+        if ch not in clients:
+            await websocket.close(code=4004)
+            return
+        ch_clients = clients[ch]
         await websocket.accept()
-        async with clients.telem_lock:
-            clients.telemetry.add(websocket)
+        async with ch_clients.telem_lock:
+            ch_clients.telemetry.add(websocket)
         try:
             while True:
                 try:
@@ -62,7 +118,7 @@ def create_app(telemetry_queue, app_core, flowgraph, channel_info=None, paths=No
                     try:
                         data = json.loads(msg)
                         if "squelch_threshold" in data:
-                            flowgraph.set_squelch_threshold(float(data["squelch_threshold"]))
+                            flowgraph.set_squelch_threshold(ch, float(data["squelch_threshold"]))
                         if "gain" in data:
                             flowgraph.set_gain(float(data["gain"]))
                     except (json.JSONDecodeError, ValueError):
@@ -74,15 +130,21 @@ def create_app(telemetry_queue, app_core, flowgraph, channel_info=None, paths=No
         except Exception:
             pass
         finally:
-            async with clients.telem_lock:
-                clients.telemetry.discard(websocket)
+            async with ch_clients.telem_lock:
+                ch_clients.telemetry.discard(websocket)
 
-    @app.websocket("/audio/live")
-    async def audio_ws(websocket: WebSocket):
+    # ── Per-channel live audio WebSocket ──────────────────
+
+    @app.websocket("/audio/{ch}/live")
+    async def audio_ws(websocket: WebSocket, ch: str):
+        if ch not in clients:
+            await websocket.close(code=4004)
+            return
+        ch_clients = clients[ch]
         await websocket.accept()
-        async with clients.audio_lock:
-            clients.audio.add(websocket)
-            clients.audio_client_count = len(clients.audio)
+        async with ch_clients.audio_lock:
+            ch_clients.audio.add(websocket)
+            ch_clients.audio_client_count = len(ch_clients.audio)
         try:
             while True:
                 await asyncio.sleep(60)
@@ -91,53 +153,36 @@ def create_app(telemetry_queue, app_core, flowgraph, channel_info=None, paths=No
         except Exception:
             pass
         finally:
-            async with clients.audio_lock:
-                clients.audio.discard(websocket)
-                clients.audio_client_count = len(clients.audio)
+            async with ch_clients.audio_lock:
+                ch_clients.audio.discard(websocket)
+                ch_clients.audio_client_count = len(ch_clients.audio)
 
-    @app.get("/api/transmissions")
-    async def get_transmissions():
-        log = app_core.get_tx_log()
-        return JSONResponse(content=log)
+    # ── Per-channel audio file download ───────────────────
 
-    @app.delete("/api/transmissions/{index}")
-    async def delete_transmission(index: int):
-        result = app_core.delete_tx(index)
-        if result:
-            return JSONResponse(content={"status": "ok"})
-        return JSONResponse(status_code=404, content={"error": "not found"})
-
-    @app.get("/api/config")
-    async def get_config():
-        return JSONResponse(content={
-            "squelch_threshold": flowgraph.get_squelch_threshold(),
-            "gain": flowgraph.get_gain(),
-        })
-
-    @app.put("/api/config")
-    async def put_config(config: dict):
-        if "squelch_threshold" in config:
-            flowgraph.set_squelch_threshold(float(config["squelch_threshold"]))
-        if "gain" in config:
-            flowgraph.set_gain(float(config["gain"]))
-        return JSONResponse(content={"status": "ok"})
-
-    @app.get("/audio/{filename}")
-    async def get_audio_file(filename: str):
+    @app.get("/audio/{ch}/{filename}")
+    async def get_audio_file(ch: str, filename: str):
+        stack = _get_stack(ch)
+        if not stack:
+            return JSONResponse(status_code=404, content={"error": "channel not found"})
         safe_name = os.path.basename(filename)
-        filepath = os.path.join(audio_dir, safe_name)
+        filepath = os.path.join(stack.paths.audio_dir, safe_name)
         if os.path.isfile(filepath):
             return FileResponse(filepath, media_type="audio/wav")
         return JSONResponse(status_code=404, content={"error": "not found"})
 
-    async def _telemetry_broadcaster():
+    # ── Telemetry broadcaster (one task per channel) ──────
+
+    async def _telemetry_broadcaster(ch_id):
         """Background task: read telemetry queue and broadcast to WebSocket clients."""
+        stack = channel_stacks[ch_id]
+        ch_clients = clients[ch_id]
+        telem_q = stack.telemetry_queue
         loop = asyncio.get_running_loop()
 
         while True:
             try:
                 telem = await loop.run_in_executor(
-                    None, lambda: telemetry_queue.get(timeout=1.0)
+                    None, lambda: telem_q.get(timeout=1.0)
                 )
             except queue.Empty:
                 continue
@@ -149,7 +194,7 @@ def create_app(telemetry_queue, app_core, flowgraph, channel_info=None, paths=No
             latest = telem
             while True:
                 try:
-                    latest = telemetry_queue.get_nowait()
+                    latest = telem_q.get_nowait()
                     if latest is None:
                         return
                 except queue.Empty:
@@ -157,49 +202,60 @@ def create_app(telemetry_queue, app_core, flowgraph, channel_info=None, paths=No
 
             msg = json.dumps({"type": "telemetry", **latest})
 
-            async with clients.telem_lock:
+            async with ch_clients.telem_lock:
                 dead = []
-                for ws in clients.telemetry:
+                for ws in ch_clients.telemetry:
                     try:
                         await ws.send_text(msg)
                     except Exception:
                         dead.append(ws)
                 for ws in dead:
-                    clients.telemetry.discard(ws)
+                    ch_clients.telemetry.discard(ws)
 
-    @app.on_event("startup")
-    async def startup():
-        clients.loop = asyncio.get_running_loop()
-        asyncio.create_task(_telemetry_broadcaster())
+    # ── Audio broadcast (one closure per channel) ─────────
 
-    def broadcast_audio(seq, chunk_bytes):
-        """Called from GNU Radio thread — schedules async broadcast."""
-        if clients.audio_client_count == 0:
-            return
-        loop = clients.loop
-        if loop is not None and loop.is_running():
-            loop.call_soon_threadsafe(
-                asyncio.ensure_future,
-                _send_audio(seq, chunk_bytes)
-            )
-
-    async def _send_audio(seq, chunk_bytes):
-        """Send timestamped PCM frame to all audio WebSocket clients."""
+    async def _send_audio(ch_id, seq, chunk_bytes):
+        """Send timestamped PCM frame to all audio WebSocket clients for a channel."""
+        ch_clients = clients[ch_id]
         header = struct.pack(">I", seq)
         frame = header + chunk_bytes
 
-        async with clients.audio_lock:
+        async with ch_clients.audio_lock:
             dead = []
-            for ws in clients.audio:
+            for ws in ch_clients.audio:
                 try:
                     await ws.send_bytes(frame)
                 except Exception:
                     dead.append(ws)
             for ws in dead:
-                clients.audio.discard(ws)
+                ch_clients.audio.discard(ws)
             if dead:
-                clients.audio_client_count = len(clients.audio)
+                ch_clients.audio_client_count = len(ch_clients.audio)
 
-    app.broadcast_audio = broadcast_audio
+    def _make_broadcast_audio(ch_id):
+        """Create a broadcast_audio callback for a specific channel."""
+        ch_clients = clients[ch_id]
+
+        def broadcast_audio(seq, chunk_bytes):
+            """Called from GNU Radio thread — schedules async broadcast."""
+            if ch_clients.audio_client_count == 0:
+                return
+            loop = loop_ref[0]
+            if loop is not None and loop.is_running():
+                loop.call_soon_threadsafe(
+                    asyncio.ensure_future,
+                    _send_audio(ch_id, seq, chunk_bytes)
+                )
+
+        return broadcast_audio
+
+    # Build per-channel broadcast_audio dict
+    app.broadcast_audio = {ch_id: _make_broadcast_audio(ch_id) for ch_id in channel_stacks}
+
+    @app.on_event("startup")
+    async def startup():
+        loop_ref[0] = asyncio.get_running_loop()
+        for ch_id in channel_stacks:
+            asyncio.create_task(_telemetry_broadcaster(ch_id))
 
     return app

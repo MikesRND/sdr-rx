@@ -37,6 +37,42 @@ header h1 {
     white-space: nowrap;
 }
 
+/* ── Channel Selector ───────────────────────────── */
+.channel-selector {
+    display: flex;
+    gap: 0;
+    background: var(--surface);
+    border-bottom: 1px solid var(--border);
+    padding: 0 20px;
+    overflow-x: auto;
+    overflow-y: hidden;
+    -webkit-overflow-scrolling: touch;
+    white-space: nowrap;
+}
+
+.channel-tab {
+    flex: 0 0 auto;
+    padding: 8px 20px;
+    background: transparent;
+    border: none;
+    border-bottom: 2px solid transparent;
+    color: var(--text-dim);
+    font-family: inherit;
+    font-size: 13px;
+    cursor: pointer;
+    letter-spacing: 1px;
+    transition: color 0.15s, border-color 0.15s;
+}
+
+.channel-tab:hover {
+    color: var(--text);
+}
+
+.channel-tab.active {
+    color: var(--blue);
+    border-bottom-color: var(--blue);
+}
+
 .status-bar {
     display: flex;
     flex-wrap: wrap;
@@ -510,6 +546,16 @@ header h1 {
 
 /* Responsive */
 @media (max-width: 768px) {
+    .channel-selector {
+        padding: 0 8px;
+    }
+
+    .channel-tab {
+        padding: 10px 12px;
+        font-size: 12px;
+        letter-spacing: 0.5px;
+    }
+
     .main-grid {
         grid-template-columns: 1fr;
         padding: 8px;

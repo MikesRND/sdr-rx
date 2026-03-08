@@ -5,40 +5,49 @@ See [DESIGN.md](DESIGN.md) for DSP signal path, state machine, threading model, 
 
 ## Architecture
 
-Three threads orchestrated from `main.py`:
+Multi-channel receiver: one RTL-SDR dongle feeds N parallel demodulation chains (max 2 per receiver). Each channel has independent squelch, RSSI, recording, and state machine. Four thread types orchestrated from `main.py`:
 
-1. **GNU Radio thread** (`gr_engine.py`): RTL-SDR → channel filter (240k→24k) → squelch → NBFM demod (24k→8k) → voice processing → AudioTapBlock. RSSI probe taps pre-squelch. DCS decoder taps raw NBFM output (before voice filtering, to preserve 146 Hz tone).
+1. **GNU Radio thread** (`gr_engine.py`): RTL-SDR source → N × (freq_xlating_filter → squelch → NBFM → {voice → AudioTapBlock, DCSDecoder}). DCS taps raw NBFM output before voice filtering. One `ReceiverFlowgraph` with per-channel block sets. RSSI probe taps pre-squelch per channel.
 
-2. **App Core thread** (`app_core.py`): 10 Hz poll loop driving a state machine (IDLE → CARRIER_DETECTED → TX_ACTIVE → TX_ENDING → IDLE). Orchestrates recording start/stop, CSV logging, telemetry queue.
+2. **App Core threads** (`app_core.py`): One per channel. 10 Hz poll loop driving a state machine (IDLE → CARRIER_DETECTED → TX_ACTIVE → TX_ENDING → IDLE). Each AppCore receives its `channel_id` and calls per-channel flowgraph methods (`get_rssi(channel_id)`, etc.). Each AppCore also runs a **finalize worker thread** that handles WAV writing, sox filtering, and disk cleanup off the poll thread (see Recording below).
 
-3. **FastAPI/uvicorn thread** (`web_server.py`): WebSocket endpoints for telemetry (`/ws`) and live audio (`/audio/live`). REST endpoints for transmission log, channel info, and runtime config changes.
+3. **Finalize worker threads** (`app_core.py`): One per channel. Dequeues `(job_id, filename, raw_audio)` from bounded queue, writes WAV, runs sox filter, cleans up disk. Keeps poll thread responsive (see Recording Finalization below).
+
+4. **FastAPI/uvicorn thread** (`web_server.py`): Per-channel WebSocket endpoints for telemetry (`/ws/{ch}`) and live audio (`/audio/{ch}/live`). Per-channel REST endpoints for transmissions, config, and audio files. One telemetry broadcaster task per channel.
+
+### Key Concepts
+
+- **Receiver**: Frozen dataclass (`config.Receiver`) representing physical SDR hardware properties (sample_rate, max_channels, gains, device_index). `DEFAULT_RECEIVER = Receiver()` in `config.py`.
+- **ChannelStack**: Groups a channel's components (app_core, audio_tap, dcs_decoder, telemetry_queue, paths) — defined in `main.py`.
+- **ChannelConfig**: Flowgraph-level channel config (channel_id, freq_hz, squelch_threshold, audio_tap, dcs_decoder) — defined in `gr_engine.py`.
 
 Cross-thread communication:
-- **Telemetry**: `queue.Queue` from AppCore → FastAPI (sentinel `None` = shutdown)
-- **Live audio**: `AudioTapBlock` callback → `loop.call_soon_threadsafe()` into asyncio event loop
+- **Telemetry**: One `queue.Queue` per channel from AppCore → FastAPI (sentinel `None` = shutdown)
+- **Live audio**: Per-channel `AudioTapBlock` callback → per-channel `broadcast_audio` closure → `loop.call_soon_threadsafe()` into asyncio event loop
 - **Shutdown**: `threading.Event` + signal handlers, graceful then force on second SIGINT
 
 ## Initialization Order (main.py)
 
-1. Resolve paths (XDG) and channel config → merge with CLI overrides
-2. Create `DCSDecoderBlock` and `AudioTapBlock` instances
-3. Create `MonitorFlowgraph` with decoder + tap blocks
-4. Create `AppCore` with flowgraph + blocks + telemetry queue
-5. Create FastAPI app via `create_app()` with queue + app_core + flowgraph
-6. Wire `audio_tap._live_callback = web_app.broadcast_audio`
-7. Start flowgraph → app_core → uvicorn (each in own thread)
-8. Main thread waits on `shutdown_event`
+1. Resolve channel configs via `resolve_channel_configs()` — validates count, dupes, file existence
+2. Load and validate each channel YAML
+3. Create `AudioTapBlock` + `DCSDecoderBlock` per channel
+4. Build list of `ChannelConfig` for the flowgraph
+5. Create single `ReceiverFlowgraph(channels=[...], receiver=receiver, gain=gain)`
+6. Create `AppCore` per channel (each gets same flowgraph ref + its `channel_id`)
+7. Create FastAPI app via `create_app(channel_stacks, flowgraph)`
+8. Wire each `audio_tap._live_callback = web_app.broadcast_audio[channel_id]`
+9. Start flowgraph → all app_cores → uvicorn
+10. Main thread waits on `shutdown_event`
 
 ## Configuration Internals
 
-### Channel Selection Precedence
+### Channel Selection
 
-`--config /path` > `--channel <id>` > `default.yaml` > built-in defaults (FRS Ch 1)
+`-c`/`--channel` is required and repeatable (up to `receiver.max_channels`). Each ID loads `~/.config/sdr-rx/channels/<id>.yaml`.
 
-- `--config` and `--channel` cannot be used together (hard error)
-- `--channel <id>` loads `~/.config/sdr-rx/channels/<id>.yaml` (hard error if missing)
-- `--config /path` loads the file directly; channel ID is derived from the filename stem
 - Channel IDs must match `^[a-zA-Z0-9_-]+$`
+- Removed: `--config`, `--freq`, `--dcs-code`, `--name` (all config comes from YAML)
+- Kept: `--init-channel`, `--list-channels` (management commands)
 
 ### DCS Role
 
@@ -46,14 +55,31 @@ DCS is **metadata enrichment only** — transmissions are always detected and re
 
 ## Key Constants (config.py)
 
-- Sample rates: `SDR_SAMPLE_RATE=240k`, `CHANNEL_RATE=24k`, `AUDIO_RATE=8k`
-- Defaults: `FREQ_HZ=462_562_500` (FRS Ch 1), `DCS_CODE=0`, `CHANNEL_NAME="FRS Ch 1"`
+- **Receiver**: `DEFAULT_RECEIVER.sample_rate=240k`, `.max_channels=2`, `.if_gain=20`, `.bb_gain=20`
+- DSP: `CHANNEL_RATE=24k`, `AUDIO_RATE=8k`, `DECIMATION=10`
+- Defaults: `FREQ_HZ=462_562_500` (template default), `RF_GAIN=40` (app default)
 - Squelch: `SQUELCH_THRESHOLD_DB=-45.0`, `SQUELCH_ALPHA=0.001`, `SQUELCH_RAMP=240`
 - DCS: `DCS_BITRATE=134.4 bps`, `DCS_GOLAY_POLY=0xAE3`, `DCS_CONSECUTIVE_MATCHES=2`
 - Timing: `POLL_RATE_HZ=10`, `CARRIER_DETECT_POLLS=2`, `TX_ENDING_TIMEOUT_S=2.0`
 - Audio: `CHUNK_SAMPLES=2000` (int16), `RING_SIZE=8` (~2s pre-trigger)
 - Disk: `MAX_AUDIO_MB=500` (auto-cleanup of oldest WAVs)
 
+## Recording Finalization
+
+When a transmission ends, `_finalize_tx()` splits work between the poll thread and a background finalize worker:
+
+- **Synchronous (poll thread):** `audio_tap.stop_recording()`, counter updates, TX log append, CSV write. This takes microseconds so the poll loop stays responsive.
+- **Asynchronous (finalize worker):** `write_wav()`, `apply_sox_filter()`, `cleanup_audio()`. Queued via bounded `queue.Queue(maxsize=4)`.
+
+Key design decisions:
+- **Job ID keying:** Each TX gets a unique job ID (`timestamp_microseconds_sequence`). Cancellation and filenames are keyed by job ID, not filename, to avoid collisions under burst traffic.
+- **Backpressure:** When the finalize queue is full, the overflow job writes a raw WAV inline (no sox) and increments `finalize_dropped`. When backlog is near capacity, sox is skipped for queued jobs too.
+- **Delete/cancel race:** `delete_tx()` calls `cancel_finalize(job_id)` which adds the job ID to a canceled set. The finalize worker checks this set before writing (skips entirely) and after writing (removes the file). The inline write path also checks cancellation after completing.
+- **Shutdown:** `stop()` sends a sentinel to the finalize queue with a non-blocking retry loop (5s timeout), then joins the worker thread (15s timeout).
+- **Telemetry:** `finalize_pending` is included in every telemetry frame for observability.
+
 ## Testing
 
-There are no tests or linting configured. The flowgraph module has a standalone test mode: `python gr_engine.py`.
+Smoke tests: `python test_dual_channel.py` (no hardware needed, uses mocks).
+Finalize tests: `python test_finalize.py` (no hardware needed, tests delete race, backpressure, shutdown drain).
+Standalone flowgraph test: `python gr_engine.py` (requires RTL-SDR).

@@ -1,12 +1,15 @@
-// SDR Monitor Dashboard — WebSocket client and UI updates
+// SDR Monitor Dashboard — Multi-channel WebSocket client and UI updates
 
 (function() {
     "use strict";
 
-    // ── Channel config (populated from /api/channel) ────
+    // ── Channel state ────────────────────────────────────
+    var channels = [];           // list from /api/channels
+    var currentChannelId = null;
     var channelDcsCode = "---";
 
     // ── Elements ───────────────────────────────────────
+    const channelSelector = document.getElementById("channelSelector");
     const channelName = document.getElementById("channelName");
     const squelchInd = document.getElementById("squelchIndicator");
     const dcsInd = document.getElementById("dcsIndicator");
@@ -35,9 +38,73 @@
     const infoDcsTotal = document.getElementById("infoDcsTotal");
     const infoDcsRate = document.getElementById("infoDcsRate");
 
+    // ── Channel selector ─────────────────────────────────
+    function renderChannelTabs() {
+        channelSelector.innerHTML = "";
+        channels.forEach(function(ch) {
+            var tab = document.createElement("button");
+            tab.className = "channel-tab" + (ch.id === currentChannelId ? " active" : "");
+            tab.textContent = ch.name;
+            tab.dataset.channelId = ch.id;
+            tab.addEventListener("click", function() {
+                if (ch.id !== currentChannelId) {
+                    switchChannel(ch.id);
+                }
+            });
+            channelSelector.appendChild(tab);
+        });
+    }
+
+    function switchChannel(channelId) {
+        currentChannelId = channelId;
+        lastTxCount = 0;
+
+        // Update tab highlights
+        var tabs = channelSelector.querySelectorAll(".channel-tab");
+        tabs.forEach(function(tab) {
+            tab.classList.toggle("active", tab.dataset.channelId === channelId);
+        });
+
+        // Reset UI state
+        squelchSlider._userSet = false;
+        gainSlider._userSet = false;
+        dcsStats.style.display = "none";
+
+        // Load channel info
+        loadChannelConfig(channelId);
+
+        // Load channel config (squelch/gain)
+        fetch("/api/channels/" + channelId + "/config")
+            .then(function(r) { return r.json(); })
+            .then(function(cfg) {
+                if (cfg.squelch_threshold !== undefined) {
+                    squelchSlider.value = cfg.squelch_threshold;
+                    thresholdLabel.textContent = cfg.squelch_threshold.toFixed(1);
+                    var threshPct = Math.max(0, Math.min(100, (cfg.squelch_threshold - RSSI_MIN) / (RSSI_MAX - RSSI_MIN) * 100));
+                    meterThreshold.style.left = threshPct + "%";
+                }
+                if (cfg.gain !== undefined) {
+                    var gPct = ((cfg.gain - GAIN_MIN) / (GAIN_MAX - GAIN_MIN)) * 100;
+                    setGainFromPct(gPct);
+                }
+            })
+            .catch(function() {});
+
+        // Reconnect telemetry WS
+        connectWS();
+
+        // Reconnect audio WS if playing
+        if (audioPlaying) {
+            connectAudioWs();
+        }
+
+        // Fetch TX log
+        fetchTxLog();
+    }
+
     // ── Fetch channel config ────────────────────────────
-    function loadChannelConfig() {
-        fetch("/api/channel")
+    function loadChannelConfig(channelId) {
+        fetch("/api/channels/" + channelId)
             .then(function(r) { return r.json(); })
             .then(function(ch) {
                 var name = ch.name || "SDR Monitor";
@@ -61,16 +128,26 @@
     let lastTxCount = 0;
 
     function connectWS() {
+        // Close existing connection
+        if (ws) {
+            ws.onclose = null;
+            ws.onerror = null;
+            ws.close();
+            ws = null;
+        }
+        if (reconnectTimer) {
+            clearTimeout(reconnectTimer);
+            reconnectTimer = null;
+        }
+
+        if (!currentChannelId) return;
+
         const proto = location.protocol === "https:" ? "wss:" : "ws:";
-        ws = new WebSocket(proto + "//" + location.host + "/ws");
+        ws = new WebSocket(proto + "//" + location.host + "/ws/" + currentChannelId);
 
         ws.onopen = function() {
             connStatus.textContent = "connected";
             connStatus.className = "status-item conn-status connected";
-            if (reconnectTimer) {
-                clearTimeout(reconnectTimer);
-                reconnectTimer = null;
-            }
         };
 
         ws.onmessage = function(ev) {
@@ -237,7 +314,8 @@
 
     // ── TX Log ─────────────────────────────────────────
     function fetchTxLog() {
-        fetch("/api/transmissions")
+        if (!currentChannelId) return;
+        fetch("/api/channels/" + currentChannelId + "/transmissions")
             .then(function(r) { return r.json(); })
             .then(function(log) {
                 txLogBody.innerHTML = "";
@@ -268,7 +346,7 @@
                     const tdAudio = document.createElement("td");
                     if (e.filename) {
                         const fname = e.filename.split("/").pop();
-                        const url = "/audio/" + encodeURIComponent(fname);
+                        const url = "/audio/" + currentChannelId + "/" + encodeURIComponent(fname);
 
                         var playBtn = document.createElement("button");
                         playBtn.className = "play-btn";
@@ -297,7 +375,7 @@
                     delBtn.addEventListener("click", function() {
                         var idx = parseInt(this.dataset.index);
                         if (!confirm("Delete this transmission entry" + (log[idx].filename ? " and its recording?" : "?"))) return;
-                        fetch("/api/transmissions/" + idx, { method: "DELETE" })
+                        fetch("/api/channels/" + currentChannelId + "/transmissions/" + idx, { method: "DELETE" })
                             .then(function(r) { return r.json(); })
                             .then(function() { fetchTxLog(); });
                     });
@@ -484,8 +562,10 @@
             audioWs = null;
         }
 
+        if (!currentChannelId) return;
+
         var proto = location.protocol === "https:" ? "wss:" : "ws:";
-        audioWs = new WebSocket(proto + "//" + location.host + "/audio/live");
+        audioWs = new WebSocket(proto + "//" + location.host + "/audio/" + currentChannelId + "/live");
         audioWs.binaryType = "arraybuffer";
 
         audioWs.onmessage = function(ev) {
@@ -605,8 +685,16 @@
     });
 
     // ── Init ───────────────────────────────────────────
-    loadChannelConfig();
-    connectWS();
-    fetchTxLog();
+    fetch("/api/channels")
+        .then(function(r) { return r.json(); })
+        .then(function(chs) {
+            channels = chs;
+            if (channels.length > 0) {
+                currentChannelId = channels[0].id;
+                renderChannelTabs();
+                switchChannel(currentChannelId);
+            }
+        })
+        .catch(function() {});
 
 })();

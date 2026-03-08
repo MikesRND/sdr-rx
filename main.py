@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
 """SDR Monitor — CLI entry point.
 
-Generic NFM SDR monitor with configurable channel name, frequency,
-and DCS code loaded from YAML config file with CLI overrides.
+Multi-channel NFM SDR monitor with configurable channels loaded
+from YAML config files. Monitors up to N channels simultaneously
+on a single RTL-SDR receiver.
 """
 
+import dataclasses
 import os
 import queue
 import signal
@@ -20,10 +22,22 @@ from config import (
     FREQ_HZ, RF_GAIN, SQUELCH_THRESHOLD_DB,
     MAX_AUDIO_MB, WEB_HOST, WEB_PORT, TX_ENDING_TIMEOUT_S,
     DEFAULT_AUDIO_PRESET, FM_TAU,
-    CHANNEL_NAME, DCS_CODE, DEFAULT_CHANNEL_ID,
-    CHANNEL_ID_RE,
-    resolve_paths, resolve_channel_config, validate_channel_id,
+    CHANNEL_NAME, DCS_CODE,
+    DEFAULT_RECEIVER, Receiver, ResolvedPaths,
+    resolve_paths, resolve_channel_configs, validate_channel_id,
 )
+
+
+@dataclasses.dataclass
+class ChannelStack:
+    """All components for one monitored channel."""
+    channel_id: str
+    channel_info: dict          # name, freq_hz, dcs_code, dcs_mode
+    app_core: object            # AppCore
+    audio_tap: object           # AudioTapBlock
+    dcs_decoder: object         # DCSDecoderBlock
+    telemetry_queue: object     # queue.Queue
+    paths: ResolvedPaths
 
 
 def _load_channel_yaml(config_path):
@@ -108,7 +122,7 @@ def _handle_init_channel(channel_id, paths):
     import shutil
     shutil.copy2(template, dest)
     click.echo(f"Created {dest}")
-    click.echo(f"Edit it to configure your channel, then run: python main.py --channel {cid}")
+    click.echo(f"Edit it to configure your channel, then run: python main.py -c {cid}")
 
 
 def _handle_list_channels(paths):
@@ -132,16 +146,8 @@ def _handle_list_channels(paths):
 
 
 @click.command()
-@click.option("--config", "config_file", default=None,
-              help="Path to channel YAML config file.")
-@click.option("--channel", "channel_id_cli", default=None, type=str,
-              help="Channel ID (loads from ~/.config/sdr-rx/channels/<id>.yaml).")
-@click.option("--freq", default=None, type=int,
-              help="Override channel frequency (Hz).")
-@click.option("--dcs-code", default=None, type=int,
-              help="Override DCS code (octal digits as decimal, e.g. 565).")
-@click.option("--name", "channel_name_cli", default=None, type=str,
-              help="Override channel display name.")
+@click.option("--channel", "-c", "channel_ids", multiple=True, type=str,
+              help="Channel ID (loads from ~/.config/sdr-rx/channels/<id>.yaml). Repeatable.")
 @click.option("--gain", "-g", default=RF_GAIN, show_default=True,
               help="RTL-SDR tuner gain (dB).")
 @click.option("--squelch", "-s", default=SQUELCH_THRESHOLD_DB, show_default=True,
@@ -168,33 +174,29 @@ def _handle_list_channels(paths):
 @click.option("--init-channel", "init_channel_id", default=None, type=str, is_eager=True,
               is_flag=False, flag_value="default",
               help="Create a channel config from template and exit. Defaults to 'default'.")
-def main(config_file, channel_id_cli, freq, dcs_code, channel_name_cli, gain, squelch,
+def main(channel_ids, gain, squelch,
          record, max_audio_mb, port, host, tx_tail, audio_preset, tau,
          data_dir, list_channels, init_channel_id):
     """SDR Monitor — GNU Radio + Web Dashboard.
 
     \b
-    Monitors a configurable NFM channel using RTL-SDR with
+    Monitors configurable NFM channels using RTL-SDR with
     RF power squelch, DCS decoding, and a web dashboard.
-    Channel settings are loaded from a YAML config file
-    and can be overridden via CLI options.
+    Channel settings are loaded from YAML config files.
 
     \b
     Examples:
-      python main.py                          # start with built-in defaults (FRS Ch 1)
-      python main.py --channel my_channel     # use named channel config
-      python main.py -g 30 -s -25             # custom gain and squelch
-      python main.py --no-record              # monitor only, no recording
-      python main.py --init-channel myradio   # create new channel config
-      python main.py --list-channels          # show available channels
+      python main.py -c my_channel                    # monitor one channel
+      python main.py -c ch1 -c ch2                    # monitor two channels
+      python main.py -c ch1 -c ch2 -g 30 -s -25      # custom gain and squelch
+      python main.py --init-channel myradio           # create new channel config
+      python main.py --list-channels                  # show available channels
     """
 
     # ── Short-circuit commands (no hardware needed) ──
-    # Resolve paths early for init/list (use temp channel ID)
     pre_paths = resolve_paths(data_dir_override=data_dir)
 
     if init_channel_id is not None:
-        # --init-channel with empty string means use default
         _handle_init_channel(init_channel_id or None, pre_paths)
         return
 
@@ -202,110 +204,124 @@ def main(config_file, channel_id_cli, freq, dcs_code, channel_name_cli, gain, sq
         _handle_list_channels(pre_paths)
         return
 
-    # ── Resolve channel config and ID ──
-    config_file_resolved, channel_id = resolve_channel_config(
-        config_path=config_file,
-        channel_id=channel_id_cli,
-        channels_dir=pre_paths.channels_dir,
+    # ── Run mode: require at least one channel ──
+    if not channel_ids:
+        click.echo("Error: at least one -c/--channel is required.", err=True)
+        click.echo("  Tip: python main.py -c <channel_id>", err=True)
+        click.echo("  Run 'python main.py --list-channels' to see available channels.", err=True)
+        sys.exit(1)
+
+    # ── Resolve and validate all channels ──
+    receiver = DEFAULT_RECEIVER
+    resolved = resolve_channel_configs(
+        channel_ids, pre_paths.channels_dir, receiver.max_channels,
     )
-
-    # ── Resolve final paths with channel ID ──
-    paths = resolve_paths(data_dir_override=data_dir, channel_id=channel_id)
-
-    # ── Build merged channel config: defaults < YAML < CLI ──
-    channel_cfg = {
-        "name": CHANNEL_NAME,
-        "freq_hz": FREQ_HZ,
-        "dcs_code": DCS_CODE,
-        "dcs_mode": "advisory",
-    }
-
-    # Layer 2: YAML overrides
-    if config_file_resolved:
-        yaml_data = _load_channel_yaml(config_file_resolved)
-        for key in ("name", "freq_hz", "dcs_code", "dcs_mode"):
-            if key in yaml_data:
-                channel_cfg[key] = yaml_data[key]
-    else:
-        click.echo(f"No channel config found. Using built-in defaults (FRS Ch 1).")
-        click.echo(f"  Tip: run 'python main.py --init-channel' to create a config.")
-
-    # Layer 3: CLI overrides
-    if freq is not None:
-        channel_cfg["freq_hz"] = freq
-    if dcs_code is not None:
-        channel_cfg["dcs_code"] = dcs_code
-    if channel_name_cli is not None:
-        channel_cfg["name"] = channel_name_cli
-
-    # Validate
-    _validate_channel_config(channel_cfg)
-
-    ch_freq = channel_cfg["freq_hz"]
-    ch_dcs = channel_cfg["dcs_code"]
-    ch_name = channel_cfg["name"]
-    ch_dcs_mode = channel_cfg["dcs_mode"]
-
-    # ── Create data directories ──
-    os.makedirs(paths.channel_data_dir, exist_ok=True)
-    if record:
-        os.makedirs(paths.audio_dir, exist_ok=True)
 
     # Apply tx-tail to config
     import config
     config.TX_ENDING_TIMEOUT_S = tx_tail
     config.TX_ENDING_POLLS = int(tx_tail * config.POLL_RATE_HZ)
 
+    # ── Load and validate each channel config ──
+    channel_cfgs = []  # list of (channel_id, channel_cfg_dict, paths)
+    for channel_id, config_path in resolved:
+        paths = resolve_paths(data_dir_override=data_dir, channel_id=channel_id)
+
+        channel_cfg = {
+            "name": CHANNEL_NAME,
+            "freq_hz": FREQ_HZ,
+            "dcs_code": DCS_CODE,
+            "dcs_mode": "advisory",
+        }
+
+        yaml_data = _load_channel_yaml(config_path)
+        for key in ("name", "freq_hz", "dcs_code", "dcs_mode"):
+            if key in yaml_data:
+                channel_cfg[key] = yaml_data[key]
+
+        _validate_channel_config(channel_cfg)
+
+        os.makedirs(paths.channel_data_dir, exist_ok=True)
+        if record:
+            os.makedirs(paths.audio_dir, exist_ok=True)
+
+        channel_cfgs.append((channel_id, channel_cfg, paths))
+
     tau_display = f"{tau}" if tau is not None else f"{FM_TAU} (default)"
-    click.echo(f"{ch_name} [{channel_id}] starting...")
-    click.echo(f"  Freq: {ch_freq/1e6:.3f} MHz | Gain: {gain} | Squelch: {squelch} dB")
-    click.echo(f"  DCS: {ch_dcs:03d} ({ch_dcs_mode}) | Record: {'ON' if record else 'OFF'} | TX tail: {tx_tail}s")
+    click.echo(f"Starting {len(channel_cfgs)} channel(s)...")
+    for cid, cfg, paths in channel_cfgs:
+        click.echo(f"  [{cid}] {cfg['name']} — {cfg['freq_hz']/1e6:.3f} MHz, DCS {cfg['dcs_code']:03d} ({cfg['dcs_mode']})")
+    click.echo(f"  Gain: {gain} | Squelch: {squelch} dB | Record: {'ON' if record else 'OFF'} | TX tail: {tx_tail}s")
     click.echo(f"  Web: http://{host}:{port} | Audio: {audio_preset} preset | tau: {tau_display}")
-    click.echo(f"  Data: {paths.channel_data_dir}")
 
     click.echo("Loading GNU Radio modules...")
-    from gr_engine import MonitorFlowgraph
+    from gr_engine import ReceiverFlowgraph, ChannelConfig
     from dcs_decoder import DCSDecoderBlock
     from audio_tap import AudioTapBlock
     from app_core import AppCore
     from web_server import create_app
 
-    # Telemetry queue: app_core → web_server
-    telemetry_queue = queue.Queue(maxsize=50)
+    # ── Build channel stacks ──
+    channel_configs = []   # for ReceiverFlowgraph
+    channel_stacks = {}    # channel_id → ChannelStack
 
-    # Create components
+    for channel_id, channel_cfg, paths in channel_cfgs:
+        telem_q = queue.Queue(maxsize=50)
+        dcs_decoder = DCSDecoderBlock(dcs_code=channel_cfg["dcs_code"])
+        audio_tap = AudioTapBlock()
+
+        channel_configs.append(ChannelConfig(
+            channel_id=channel_id,
+            freq_hz=channel_cfg["freq_hz"],
+            squelch_threshold=squelch,
+            audio_tap=audio_tap,
+            dcs_decoder=dcs_decoder,
+        ))
+
+        channel_stacks[channel_id] = ChannelStack(
+            channel_id=channel_id,
+            channel_info=channel_cfg,
+            app_core=None,  # set after flowgraph creation
+            audio_tap=audio_tap,
+            dcs_decoder=dcs_decoder,
+            telemetry_queue=telem_q,
+            paths=paths,
+        )
+
+    # ── Create flowgraph ──
     click.echo("Building flowgraph...")
-    dcs_decoder = DCSDecoderBlock(dcs_code=ch_dcs)
-    audio_tap = AudioTapBlock()
-
-    flowgraph = MonitorFlowgraph(
-        freq=ch_freq,
+    flowgraph = ReceiverFlowgraph(
+        channels=channel_configs,
+        receiver=receiver,
         gain=gain,
-        squelch_threshold=squelch,
-        audio_tap=audio_tap,
-        dcs_decoder=dcs_decoder,
         audio_preset=audio_preset,
         tau=tau,
     )
 
-    app_core = AppCore(
-        flowgraph=flowgraph,
-        audio_tap=audio_tap,
-        dcs_decoder=dcs_decoder,
-        telemetry_queue=telemetry_queue,
-        record=record,
-        max_audio_mb=max_audio_mb,
-        channel_name=ch_name,
-        dcs_code=ch_dcs,
-        dcs_mode=ch_dcs_mode,
-        paths=paths,
-    )
+    # ── Create AppCore per channel ──
+    for channel_id, channel_cfg, paths in channel_cfgs:
+        stack = channel_stacks[channel_id]
+        app_core = AppCore(
+            flowgraph=flowgraph,
+            audio_tap=stack.audio_tap,
+            dcs_decoder=stack.dcs_decoder,
+            telemetry_queue=stack.telemetry_queue,
+            record=record,
+            max_audio_mb=max_audio_mb,
+            channel_name=channel_cfg["name"],
+            dcs_code=channel_cfg["dcs_code"],
+            dcs_mode=channel_cfg["dcs_mode"],
+            paths=paths,
+            channel_id=channel_id,
+        )
+        stack.app_core = app_core
 
-    web_app = create_app(telemetry_queue, app_core, flowgraph,
-                         channel_info=channel_cfg, paths=paths)
+    # ── Create web app ──
+    web_app = create_app(channel_stacks, flowgraph)
 
-    # Wire live audio callback
-    audio_tap._live_callback = web_app.broadcast_audio
+    # Wire live audio callbacks
+    for channel_id, stack in channel_stacks.items():
+        stack.audio_tap._live_callback = web_app.broadcast_audio[channel_id]
 
     # Shutdown coordination
     shutdown_event = threading.Event()
@@ -314,7 +330,6 @@ def main(config_file, channel_id_cli, freq, dcs_code, channel_name_cli, gain, sq
     def signal_handler(sig, frame):
         nonlocal _shutting_down
         if _shutting_down:
-            # Second signal — force exit
             click.echo("\nForce exit.")
             os._exit(1)
         _shutting_down = True
@@ -324,15 +339,16 @@ def main(config_file, channel_id_cli, freq, dcs_code, channel_name_cli, gain, sq
     signal.signal(signal.SIGINT, signal_handler)
     signal.signal(signal.SIGTERM, signal_handler)
 
-    # Start GNU Radio flowgraph (Thread 1)
+    # Start GNU Radio flowgraph
     click.echo("Starting GNU Radio flowgraph...")
     flowgraph.start()
 
-    # Start app core polling (Thread 2)
-    click.echo("Starting state machine...")
-    app_core.start()
+    # Start app core polling (one thread per channel)
+    click.echo("Starting state machines...")
+    for stack in channel_stacks.values():
+        stack.app_core.start()
 
-    # Start web server (Thread 3)
+    # Start web server
     click.echo(f"Starting web dashboard on http://{host}:{port}")
     uvicorn_config = uvicorn.Config(
         web_app,
@@ -355,12 +371,14 @@ def main(config_file, channel_id_cli, freq, dcs_code, channel_name_cli, gain, sq
     except KeyboardInterrupt:
         pass
 
-    # Shutdown sequence — each step has a timeout to prevent hanging
-    click.echo("Stopping app core...")
-    app_core.stop()
+    # Shutdown sequence
+    click.echo("Stopping app cores...")
+    for stack in channel_stacks.values():
+        stack.app_core.stop()
 
-    click.echo("Sending telemetry sentinel...")
-    telemetry_queue.put(None)
+    click.echo("Sending telemetry sentinels...")
+    for stack in channel_stacks.values():
+        stack.telemetry_queue.put(None)
 
     click.echo("Stopping web server...")
     server.should_exit = True
