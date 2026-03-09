@@ -8,7 +8,7 @@ import os
 import queue
 import threading
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 from collections import deque
 
 import config as cfg
@@ -33,7 +33,8 @@ class AppCore:
 
     def __init__(self, flowgraph, audio_tap, dcs_decoder, telemetry_queue,
                  record=True, max_audio_mb=500, channel_name="FRS Ch 1",
-                 dcs_code=0, dcs_mode="advisory", paths=None, *, channel_id):
+                 dcs_code=0, dcs_mode="advisory", paths=None, *, channel_id,
+                 log_days=7):
         self._fg = flowgraph
         self._channel_id = channel_id
         self._audio_tap = audio_tap
@@ -47,6 +48,7 @@ class AppCore:
         self._file_prefix = sanitize_name(channel_name)
         self._channel_data_dir = paths.channel_data_dir if paths else "."
         self._audio_dir = paths.audio_dir if paths else "audio"
+        self._log_days = log_days
         self._state = self.IDLE
         self._running = False
         self._thread = None
@@ -382,45 +384,57 @@ class AppCore:
             print(f"[AppCore] CSV log error: {e}")
 
     def _load_csv_log(self):
-        """Load today's CSV log into the in-memory TX log on startup."""
-        csv_path = os.path.join(self._channel_data_dir, f"{datetime.now().strftime('%Y%m%d')}.csv")
-        if not os.path.exists(csv_path):
+        """Load the most recent N days of CSV logs into the in-memory TX log on startup."""
+        today = datetime.now().date()
+        csv_files = []
+        for day_offset in range(self._log_days):
+            d = today - timedelta(days=day_offset)
+            csv_path = os.path.join(self._channel_data_dir, f"{d.strftime('%Y%m%d')}.csv")
+            if os.path.exists(csv_path):
+                csv_files.append(csv_path)
+
+        if not csv_files:
             return
-        try:
-            with open(csv_path, newline="") as f:
-                reader = csv.DictReader(f)
-                for row in reader:
-                    filename = row.get("filename", "")
-                    if filename:
-                        filename = os.path.join(self._audio_dir, filename)
-                    # Find RSSI column regardless of unit suffix
-                    rssi_val = -100.0
-                    for key in row:
-                        if key.startswith("peak_rssi"):
-                            try:
-                                rssi_val = float(row[key])
-                            except (ValueError, TypeError):
-                                pass
-                            break
-                    entry = {
-                        "date": row.get("date", ""),
-                        "time": row.get("time", ""),
-                        "duration": float(row.get("duration_sec", 0)),
-                        "peak_rssi": rssi_val,
-                        "dcs_confirmed": row.get("dcs_confirmed", "") == "True",
-                        "dcs_polarity": row.get("dcs_polarity", "unknown"),
-                        "filename": filename if filename else None,
-                    }
-                    if row.get("dcs_mismatch"):
-                        entry["dcs_mismatch"] = row["dcs_mismatch"] == "True"
-                    self._tx_log.append(entry)
-                self._tx_count = len(self._tx_log)
-                # Reconstruct DCS match counters from loaded log
-                self._tx_with_dcs_match = sum(1 for e in self._tx_log if e.get("dcs_confirmed"))
-                self._tx_without_dcs_match = self._tx_count - self._tx_with_dcs_match
-                print(f"[AppCore] Loaded {self._tx_count} entries from {os.path.basename(csv_path)}")
-        except Exception as e:
-            print(f"[AppCore] Could not load CSV log: {e}")
+
+        # Load oldest first so the deque keeps the most recent entries
+        loaded = 0
+        for csv_path in reversed(csv_files):
+            try:
+                with open(csv_path, newline="") as f:
+                    reader = csv.DictReader(f)
+                    for row in reader:
+                        filename = row.get("filename", "")
+                        if filename:
+                            filename = os.path.join(self._audio_dir, filename)
+                        # Find RSSI column regardless of unit suffix
+                        rssi_val = -100.0
+                        for key in row:
+                            if key.startswith("peak_rssi"):
+                                try:
+                                    rssi_val = float(row[key])
+                                except (ValueError, TypeError):
+                                    pass
+                                break
+                        entry = {
+                            "date": row.get("date", ""),
+                            "time": row.get("time", ""),
+                            "duration": float(row.get("duration_sec", 0)),
+                            "peak_rssi": rssi_val,
+                            "dcs_confirmed": row.get("dcs_confirmed", "") == "True",
+                            "dcs_polarity": row.get("dcs_polarity", "unknown"),
+                            "filename": filename if filename else None,
+                        }
+                        if row.get("dcs_mismatch"):
+                            entry["dcs_mismatch"] = row["dcs_mismatch"] == "True"
+                        self._tx_log.append(entry)
+                        loaded += 1
+            except Exception as e:
+                print(f"[AppCore] Could not load {os.path.basename(csv_path)}: {e}")
+
+        self._tx_count = len(self._tx_log)
+        self._tx_with_dcs_match = sum(1 for e in self._tx_log if e.get("dcs_confirmed"))
+        self._tx_without_dcs_match = self._tx_count - self._tx_with_dcs_match
+        print(f"[AppCore] Loaded {loaded} entries from {len(csv_files)} CSV file(s)")
 
     def _push_telemetry(self, rssi, squelch_open, dcs_detected, dcs_polarity):
         """Push telemetry dict to queue for WebSocket broadcast."""

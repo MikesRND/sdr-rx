@@ -2,7 +2,7 @@
 
 ## Overview
 
-Multi-channel NFM SDR monitor using GNU Radio + FastAPI web dashboard. One RTL-SDR dongle feeds up to 2 simultaneous demodulation channels, each with independent squelch, recording, and state machine. Channels are configured via YAML configs in `~/.config/sdr-rx/channels/`.
+Multi-channel NFM SDR monitor using GNU Radio + FastAPI web dashboard. One RTL-SDR dongle feeds up to 2 simultaneous demodulation channels, each with independent squelch, recording, and state machine. Channels are defined in a consolidated channel database at `~/.config/sdr-rx/config.yaml`; the `startup_channels` setting determines which channels to monitor by default (overridable via CLI `-c` flags).
 
 Key features:
 - Multi-channel monitoring (up to 2 channels per receiver, configurable)
@@ -335,6 +335,13 @@ All data routes are per-channel, keyed by `{ch}` (channel ID).
 | GET | `/api/channels/{ch}/config` | Per-channel squelch + shared gain (read-only, for slider sync) |
 | GET | `/api/channels/{ch}/transmissions` | Per-channel TX log |
 | DELETE | `/api/channels/{ch}/transmissions/{idx}` | Per-channel delete |
+| GET | `/api/runtime` | Runtime state (active channels, CLI overrides for gain/squelch/etc.) |
+| GET | `/api/config` | Persisted config (read full `config.yaml` contents) |
+| POST | `/api/config/channels` | Create a new channel in config |
+| PUT | `/api/config/channels/{id}` | Update an existing channel in config |
+| DELETE | `/api/config/channels/{id}` | Delete a channel from config |
+| PUT | `/api/config/settings` | Update persisted settings (gain, squelch, etc.) |
+| PUT | `/api/config/startup_channels` | Update the `startup_channels` list in config |
 | WS | `/ws/{ch}` | Per-channel telemetry (accepts `squelch_threshold` and `gain` config writes) |
 | WS | `/audio/{ch}/live` | Per-channel live PCM audio (4-byte seq + 8 kHz s16le mono chunks) |
 | GET | `/audio/{ch}/{filename}` | Per-channel WAV download |
@@ -346,6 +353,7 @@ Config writes (squelch threshold, gain) are sent as JSON over the telemetry WebS
 Vanilla HTML/CSS/JS, no frameworks. Dark theme with CSS grid layout. Responsive design for mobile.
 
 Components:
+- **Settings modal** (gear icon in header, opens persisted config editor)
 - **Channel selector** (tab bar between header and main grid, one tab per channel)
 - Status bar with LED indicators (squelch, DCS, recording, connection)
 - Signal level meter (color-coded bar with threshold marker)
@@ -377,14 +385,13 @@ sdr-rx/
 ├── audio_tap.py         # AudioTapBlock — ring buffer + recording
 ├── app_core.py          # State machine, CSV logging, finalize worker (one instance per channel)
 ├── web_server.py        # FastAPI, per-channel WebSocket/REST endpoints
-├── config.py            # Receiver dataclass, constants, path resolution
+├── config.py            # DEFAULT_CHANNELS, SETTINGS_SCHEMA, load_config(), save_config(), validate_channel(), validate_settings()
 ├── recording.py         # WAV writing, sox filter (HPF + mono→stereo), disk cleanup
 ├── test_dual_channel.py # Smoke tests (no hardware needed)
 ├── test_finalize.py     # Finalize regression tests (delete race, backpressure, shutdown)
 ├── requirements.txt     # Python dependencies (includes pyyaml)
 ├── DESIGN.md            # This file
-├── examples/
-│   └── channel_template.yaml  # Template for --init-channel
+├── DESIGN-UI.md         # UI design details
 └── static/
     ├── index.html       # Dashboard page with channel selector
     ├── app.js           # Multi-channel WebSocket client, channel switching
@@ -394,13 +401,13 @@ sdr-rx/
 ## CLI Options
 
 ```
---channel, -c        Channel ID (repeatable, required in run mode).
-                     Loads from ~/.config/sdr-rx/channels/<id>.yaml.
+--channel, -c        Channel ID (repeatable). Overrides startup_channels from
+                     config.yaml. Channels must exist in config.yaml.
 --data-dir           Override data directory
---list-channels      List available channel configs and exit
---init-channel       Create a channel config from template and exit
---gain, -g           RTL-SDR tuner gain in dB (default: 40)
---squelch, -s        RF power squelch threshold in dB (default: -45.0)
+--gain, -g           RTL-SDR tuner gain in dB (default: from config).
+                     CLI value is tracked as an override, reported via /api/runtime.
+--squelch, -s        RF power squelch threshold in dB (default: from config).
+                     CLI value is tracked as an override, reported via /api/runtime.
 --record / --no-record, -r/-R   Record transmissions to WAV (default: on)
 --max-audio-mb       Max audio folder size in MB (default: 500)
 --port, -p           Web dashboard port (default: 8080)
@@ -410,13 +417,13 @@ sdr-rx/
 --tau                FM de-emphasis time constant in seconds (default: 0, i.e. none)
 ```
 
+CLI flags like `--gain` and `--squelch` act as runtime overrides: they take precedence over persisted `config.yaml` values for the current session but do not modify the config file. The `/api/runtime` endpoint reports which values are overridden.
+
 Examples:
 ```
-python main.py -c my_channel                    # monitor one channel
-python main.py -c ch1 -c ch2                    # monitor two channels
-python main.py -c ch1 -c ch2 -g 30 -s -25      # custom gain and squelch
-python main.py --init-channel myradio           # create new channel config
-python main.py --list-channels                  # show available channels
+python main.py                                  # monitor startup_channels from config.yaml
+python main.py -c ch1 -c ch2                    # override startup_channels
+python main.py -c ch1 -c ch2 -g 30 -s -25      # custom gain and squelch overrides
 ```
 
 ## Dependencies

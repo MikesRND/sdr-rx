@@ -22,7 +22,6 @@ def _make_paths(tmpdir, channel_id="test"):
     """Create ResolvedPaths pointing into a temp directory."""
     return ResolvedPaths(
         config_dir=tmpdir,
-        channels_dir=tmpdir,
         data_root=tmpdir,
         channel_data_dir=os.path.join(tmpdir, channel_id),
         audio_dir=os.path.join(tmpdir, channel_id, "audio"),

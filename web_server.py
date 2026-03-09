@@ -1,4 +1,4 @@
-"""FastAPI web server with multi-channel WebSocket telemetry and live audio streaming."""
+"""FastAPI web server with multi-channel WebSocket telemetry, live audio, and config management."""
 
 import asyncio
 import json
@@ -11,8 +11,13 @@ from pathlib import Path
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse, FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
+from starlette.requests import Request
 
-from config import TELEMETRY_RATE_HZ
+from config import (
+    TELEMETRY_RATE_HZ, CHANNEL_RATE, CHANNEL_ID_RE,
+    SETTINGS_SCHEMA, DEFAULT_SETTINGS,
+    load_config, save_config, validate_channel, validate_settings,
+)
 
 STATIC_DIR = Path(__file__).parent / "static"
 
@@ -27,11 +32,17 @@ class _ClientSets:
         self.audio_client_count = 0  # thread-safe via GIL for simple int reads
 
 
-def create_app(channel_stacks, flowgraph):
+def create_app(channel_stacks, flowgraph, *, config_dir=None, receiver=None, cli_overrides=None,
+               shutdown_event=None):
     """Create and configure the FastAPI application for multi-channel monitoring."""
 
     app = FastAPI(title="SDR Monitor")
     app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
+
+    _cli_overrides = cli_overrides or {}
+    _config_dir = config_dir
+    _receiver = receiver
+    app._restart_requested = False
 
     # Per-channel client sets
     clients = {ch_id: _ClientSets() for ch_id in channel_stacks}
@@ -40,6 +51,9 @@ def create_app(channel_stacks, flowgraph):
     def _get_stack(ch):
         """Look up channel stack, return None if not found."""
         return channel_stacks.get(ch)
+
+    def _running_channel_ids():
+        return list(channel_stacks.keys())
 
     # ── Dashboard ─────────────────────────────────────────
 
@@ -100,6 +114,309 @@ def create_app(channel_stacks, flowgraph):
             return JSONResponse(content={"status": "ok"})
         return JSONResponse(status_code=404, content={"error": "not found"})
 
+    # ── Runtime state (read-only) ─────────────────────────
+
+    @app.get("/api/runtime")
+    async def get_runtime():
+        running = _running_channel_ids()
+
+        # Build effective settings with source tracking
+        cfg = load_config(_config_dir) if _config_dir else {"settings": {}}
+        config_settings = cfg.get("settings", {})
+        settings_from_file = cfg.get("_settings_from_file", set())
+
+        effective = {}
+        for key, schema in SETTINGS_SCHEMA.items():
+            default_val = schema["default"]
+            cli_val = _cli_overrides.get(key)
+
+            if cli_val is not None:
+                effective[key] = {"value": cli_val, "source": "cli", "locked": True}
+            elif key == "gain":
+                # Gain is live-adjustable — read from flowgraph
+                live_gain = flowgraph.get_gain()
+                saved_gain = config_settings.get("gain", default_val)
+                if key in settings_from_file and abs(live_gain - saved_gain) < 0.01:
+                    effective[key] = {"value": live_gain, "source": "config", "locked": False}
+                elif abs(live_gain - default_val) < 0.01:
+                    effective[key] = {"value": live_gain, "source": "default", "locked": False}
+                else:
+                    effective[key] = {"value": live_gain, "source": "runtime", "locked": False}
+            elif key in settings_from_file:
+                effective[key] = {"value": config_settings[key], "source": "config", "locked": False}
+            else:
+                effective[key] = {"value": default_val, "source": "default", "locked": False}
+
+        # Channel runtime state (per-channel overrides)
+        channel_runtime = {}
+        squelch_cli = _cli_overrides.get("squelch")
+        for ch_id in running:
+            ch_rt = {}
+            if squelch_cli is not None:
+                ch_rt["squelch"] = {"value": squelch_cli, "source": "cli", "locked": True}
+            else:
+                live_sq = flowgraph.get_squelch_threshold(ch_id)
+                stack = channel_stacks[ch_id]
+                ch_cfg_sq = stack.channel_info.get("squelch")
+                if ch_cfg_sq is not None and abs(live_sq - ch_cfg_sq) < 0.01:
+                    ch_rt["squelch"] = {"value": live_sq, "source": "config", "locked": False}
+                else:
+                    ch_rt["squelch"] = {"value": live_sq, "source": "runtime", "locked": False}
+            channel_runtime[ch_id] = ch_rt
+
+        receiver_info = {}
+        if _receiver:
+            receiver_info = {
+                "device_index": _receiver.device_index,
+                "sample_rate": _receiver.sample_rate,
+                "max_channels": _receiver.max_channels,
+                "if_gain": _receiver.if_gain,
+                "bb_gain": _receiver.bb_gain,
+            }
+
+        return JSONResponse(content={
+            "receiver": receiver_info,
+            "running_channels": running,
+            "effective_settings": effective,
+            "channel_runtime": channel_runtime,
+        })
+
+    # ── Persisted config CRUD ─────────────────────────────
+
+    @app.get("/api/config")
+    async def get_full_config():
+        if not _config_dir:
+            return JSONResponse(status_code=500, content={"error": "config_dir not set"})
+        cfg = load_config(_config_dir)
+        running = _running_channel_ids()
+        startup = cfg.get("startup_channels", [])
+
+        # Add convenience fields per channel
+        channels_out = {}
+        for ch_id, ch_data in cfg.get("channels", {}).items():
+            ch_out = dict(ch_data)
+            ch_out["startup_selected"] = ch_id in startup
+            ch_out["running"] = ch_id in running
+            channels_out[ch_id] = ch_out
+
+        return JSONResponse(content={
+            "channels": channels_out,
+            "startup_channels": startup,
+            "settings": cfg.get("settings", {}),
+        })
+
+    @app.post("/api/config/channels")
+    async def create_channel(request: Request):
+        if not _config_dir:
+            return JSONResponse(status_code=500, content={"error": "config_dir not set"})
+
+        body = await request.json()
+        ch_id = body.get("id", "").strip()
+
+        # Validate ID
+        if not ch_id or not CHANNEL_ID_RE.match(ch_id):
+            return JSONResponse(status_code=400, content={
+                "errors": {"id": "must match [a-zA-Z0-9_-]+"}
+            })
+
+        cfg = load_config(_config_dir)
+        if ch_id in cfg["channels"]:
+            return JSONResponse(status_code=409, content={
+                "errors": {"id": f"channel '{ch_id}' already exists"}
+            })
+
+        ch_data = {
+            "name": body.get("name", ""),
+            "freq_hz": body.get("freq_hz", 0),
+            "dcs_code": body.get("dcs_code", 0),
+            "dcs_mode": body.get("dcs_mode", "advisory"),
+        }
+        if "squelch" in body:
+            ch_data["squelch"] = body["squelch"]
+
+        errors = validate_channel(ch_data)
+        if errors:
+            return JSONResponse(status_code=400, content={"errors": errors})
+
+        cfg["channels"][ch_id] = ch_data
+        save_config(_config_dir, cfg)
+        return JSONResponse(content={"status": "ok", "id": ch_id})
+
+    @app.put("/api/config/channels/{ch_id}")
+    async def update_channel(ch_id: str, request: Request):
+        if not _config_dir:
+            return JSONResponse(status_code=500, content={"error": "config_dir not set"})
+
+        cfg = load_config(_config_dir)
+        if ch_id not in cfg["channels"]:
+            return JSONResponse(status_code=404, content={"error": "channel not found"})
+
+        body = await request.json()
+        running = _running_channel_ids()
+        is_running = ch_id in running
+        locked_fields = ["freq_hz", "dcs_code", "dcs_mode"]
+
+        # Enforce running-channel restrictions
+        if is_running:
+            for field in locked_fields:
+                if field in body:
+                    old_val = cfg["channels"][ch_id].get(field)
+                    if body[field] != old_val:
+                        return JSONResponse(status_code=409, content={
+                            "error": f"cannot change {field} on running channel",
+                            "locked_fields": locked_fields,
+                        })
+
+        # Build updated channel
+        updated = dict(cfg["channels"][ch_id])
+        for key in ("name", "freq_hz", "dcs_code", "dcs_mode", "squelch"):
+            if key in body:
+                updated[key] = body[key]
+
+        errors = validate_channel(updated)
+        if errors:
+            return JSONResponse(status_code=400, content={"errors": errors})
+
+        # If freq_hz changed and this channel is in the startup set,
+        # revalidate the startup set's bandwidth spread
+        startup = cfg.get("startup_channels", [])
+        if "freq_hz" in body and ch_id in startup and len(startup) > 1:
+            # Temporarily apply the update to check bandwidth
+            old_channels = cfg["channels"]
+            test_channels = dict(old_channels)
+            test_channels[ch_id] = updated
+            startup_freqs = []
+            for sid in startup:
+                if sid in test_channels and "freq_hz" in test_channels[sid]:
+                    startup_freqs.append(test_channels[sid]["freq_hz"])
+            if len(startup_freqs) > 1:
+                spread = max(startup_freqs) - min(startup_freqs)
+                sample_rate = _receiver.sample_rate if _receiver else 240_000
+                max_spread = sample_rate - CHANNEL_RATE
+                if spread > max_spread:
+                    return JSONResponse(status_code=400, content={
+                        "error": f"this change would make the startup set invalid: "
+                                 f"channels would span {spread/1e3:.1f} kHz, "
+                                 f"exceeding usable bandwidth {max_spread/1e3:.1f} kHz"
+                    })
+
+        cfg["channels"][ch_id] = updated
+        save_config(_config_dir, cfg)
+
+        # Apply live squelch if running
+        if is_running and "squelch" in body:
+            squelch_cli = _cli_overrides.get("squelch")
+            if squelch_cli is None:
+                flowgraph.set_squelch_threshold(ch_id, float(body["squelch"]))
+
+        return JSONResponse(content={"status": "ok"})
+
+    @app.delete("/api/config/channels/{ch_id}")
+    async def delete_channel(ch_id: str):
+        if not _config_dir:
+            return JSONResponse(status_code=500, content={"error": "config_dir not set"})
+
+        cfg = load_config(_config_dir)
+        if ch_id not in cfg["channels"]:
+            return JSONResponse(status_code=404, content={"error": "channel not found"})
+
+        running = _running_channel_ids()
+        if ch_id in running:
+            return JSONResponse(status_code=409, content={
+                "error": "cannot delete running channel",
+            })
+
+        del cfg["channels"][ch_id]
+        # Remove from startup_channels if present
+        if ch_id in cfg.get("startup_channels", []):
+            cfg["startup_channels"] = [c for c in cfg["startup_channels"] if c != ch_id]
+        save_config(_config_dir, cfg)
+        return JSONResponse(content={"status": "ok"})
+
+    @app.put("/api/config/settings")
+    async def update_settings(request: Request):
+        if not _config_dir:
+            return JSONResponse(status_code=500, content={"error": "config_dir not set"})
+
+        body = await request.json()
+        errors = validate_settings(body)
+        if errors:
+            return JSONResponse(status_code=400, content={"errors": errors})
+
+        cfg = load_config(_config_dir)
+        for key, value in body.items():
+            if key in SETTINGS_SCHEMA:
+                cfg["settings"][key] = value
+
+        save_config(_config_dir, cfg)
+
+        # Apply live gain if not CLI-locked
+        if "gain" in body and "gain" not in _cli_overrides:
+            flowgraph.set_gain(float(body["gain"]))
+
+        return JSONResponse(content={"status": "ok"})
+
+    @app.put("/api/config/startup_channels")
+    async def update_startup_channels(request: Request):
+        if not _config_dir:
+            return JSONResponse(status_code=500, content={"error": "config_dir not set"})
+
+        body = await request.json()
+        channels_list = body.get("channels", [])
+
+        if not isinstance(channels_list, list):
+            return JSONResponse(status_code=400, content={
+                "error": "channels must be a list"
+            })
+
+        cfg = load_config(_config_dir)
+        all_channels = cfg.get("channels", {})
+        max_ch = _receiver.max_channels if _receiver else 2
+
+        # Validate: no dupes
+        if len(channels_list) != len(set(channels_list)):
+            return JSONResponse(status_code=400, content={
+                "error": "duplicate channel IDs"
+            })
+
+        # Validate: count
+        if len(channels_list) > max_ch:
+            return JSONResponse(status_code=400, content={
+                "error": f"too many channels (max {max_ch})"
+            })
+
+        # Validate: all exist
+        for cid in channels_list:
+            if cid not in all_channels:
+                return JSONResponse(status_code=400, content={
+                    "error": f"channel '{cid}' not found in config"
+                })
+
+        # Validate: bandwidth spread
+        if len(channels_list) > 1:
+            freqs = [all_channels[cid]["freq_hz"] for cid in channels_list]
+            spread = max(freqs) - min(freqs)
+            sample_rate = _receiver.sample_rate if _receiver else 240_000
+            max_spread = sample_rate - CHANNEL_RATE
+            if spread > max_spread:
+                return JSONResponse(status_code=400, content={
+                    "error": f"selected channels span {spread/1e3:.1f} kHz, "
+                             f"exceeding usable bandwidth {max_spread/1e3:.1f} kHz"
+                })
+
+        cfg["startup_channels"] = channels_list
+        save_config(_config_dir, cfg)
+        return JSONResponse(content={"status": "ok"})
+
+    # ── Restart ────────────────────────────────────────────
+
+    @app.post("/api/restart")
+    async def restart():
+        app._restart_requested = True
+        if shutdown_event:
+            shutdown_event.set()
+        return JSONResponse(content={"status": "restarting"})
+
     # ── Per-channel telemetry WebSocket ───────────────────
 
     @app.websocket("/ws/{ch}")
@@ -118,9 +435,15 @@ def create_app(channel_stacks, flowgraph):
                     try:
                         data = json.loads(msg)
                         if "squelch_threshold" in data:
-                            flowgraph.set_squelch_threshold(ch, float(data["squelch_threshold"]))
+                            if "squelch" not in _cli_overrides:
+                                flowgraph.set_squelch_threshold(ch, float(data["squelch_threshold"]))
+                            else:
+                                await websocket.send_text(json.dumps({"type": "locked", "field": "squelch"}))
                         if "gain" in data:
-                            flowgraph.set_gain(float(data["gain"]))
+                            if "gain" not in _cli_overrides:
+                                flowgraph.set_gain(float(data["gain"]))
+                            else:
+                                await websocket.send_text(json.dumps({"type": "locked", "field": "gain"}))
                     except (json.JSONDecodeError, ValueError):
                         pass
                 except asyncio.TimeoutError:

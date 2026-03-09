@@ -1,4 +1,5 @@
-// SDR Monitor Dashboard — Multi-channel WebSocket client and UI updates
+// SDR Monitor Dashboard — Multi-channel WebSocket client, UI updates, and settings modal
+// Modal open/close/tabs are defined inline in index.html (before this file loads)
 
 (function() {
     "use strict";
@@ -7,6 +8,9 @@
     var channels = [];           // list from /api/channels
     var currentChannelId = null;
     var channelDcsCode = "---";
+
+    // ── Runtime state (from /api/runtime) ────────────────
+    var runtimeState = null;     // fetched on load + modal open
 
     // ── Elements ───────────────────────────────────────
     const channelSelector = document.getElementById("channelSelector");
@@ -37,6 +41,9 @@
     const infoDcsMatch = document.getElementById("infoDcsMatch");
     const infoDcsTotal = document.getElementById("infoDcsTotal");
     const infoDcsRate = document.getElementById("infoDcsRate");
+    const gainRow = document.getElementById("gainRow");
+    const gainLockLabel = document.getElementById("gainLockLabel");
+    const squelchLockLabel = document.getElementById("squelchLockLabel");
 
     // ── Channel selector ─────────────────────────────────
     function renderChannelTabs() {
@@ -53,6 +60,19 @@
             });
             channelSelector.appendChild(tab);
         });
+
+        // Show a "+" tab if there's room for more channels
+        var maxCh = runtimeState && runtimeState.receiver ? runtimeState.receiver.max_channels : 2;
+        if (channels.length < maxCh) {
+            var addTab = document.createElement("button");
+            addTab.className = "channel-tab channel-tab-add";
+            addTab.textContent = "+";
+            addTab.title = "Add channel";
+            addTab.addEventListener("click", function() {
+                window.SDR.openSettings(true);
+            });
+            channelSelector.appendChild(addTab);
+        }
     }
 
     function switchChannel(channelId) {
@@ -100,6 +120,9 @@
 
         // Fetch TX log
         fetchTxLog();
+
+        // Re-apply lock state for this channel
+        applyLockState();
     }
 
     // ── Fetch channel config ────────────────────────────
@@ -120,6 +143,45 @@
                 infoDcs.textContent = "DPL " + dcsCode;
             })
             .catch(function() {});
+    }
+
+    // ── Runtime state fetch + control locking ────────────
+    function fetchRuntime() {
+        return fetch("/api/runtime")
+            .then(function(r) { return r.json(); })
+            .then(function(data) {
+                runtimeState = data;
+                applyLockState();
+                return data;
+            })
+            .catch(function() { return null; });
+    }
+
+    function applyLockState() {
+        if (!runtimeState) return;
+
+        var eff = runtimeState.effective_settings || {};
+        var chRt = runtimeState.channel_runtime || {};
+
+        // Gain lock
+        var gainInfo = eff.gain || {};
+        if (gainInfo.locked) {
+            gainRow.classList.add("locked");
+            gainLockLabel.style.display = "";
+        } else {
+            gainRow.classList.remove("locked");
+            gainLockLabel.style.display = "none";
+        }
+
+        // Squelch lock (per-channel)
+        var chSq = (chRt[currentChannelId] || {}).squelch || {};
+        if (chSq.locked) {
+            meterThreshold.classList.add("locked");
+            squelchLockLabel.style.display = "";
+        } else {
+            meterThreshold.classList.remove("locked");
+            squelchLockLabel.style.display = "none";
+        }
     }
 
     // ── Telemetry WebSocket ────────────────────────────
@@ -406,7 +468,20 @@
         return Math.round(db * 2) / 2;
     }
 
+    function isSquelchLocked() {
+        if (!runtimeState || !currentChannelId) return false;
+        var chRt = (runtimeState.channel_runtime || {})[currentChannelId];
+        return chRt && chRt.squelch && chRt.squelch.locked;
+    }
+
+    function isGainLocked() {
+        if (!runtimeState) return false;
+        var g = (runtimeState.effective_settings || {}).gain;
+        return g && g.locked;
+    }
+
     function applySquelch(db) {
+        if (isSquelchLocked()) return;
         ensureAudioCtxRunning();
         squelchSlider._userSet = true;
         squelchSlider.value = db;
@@ -423,6 +498,7 @@
 
     // Mouse drag
     meterThreshold.addEventListener("mousedown", function(e) {
+        if (isSquelchLocked()) return;
         e.preventDefault();
         meterThreshold.classList.add("dragging");
         function onMove(e) { applySquelch(posToDb(e.clientX)); }
@@ -437,6 +513,7 @@
 
     // Touch drag
     meterThreshold.addEventListener("touchstart", function(e) {
+        if (isSquelchLocked()) return;
         e.preventDefault();
         meterThreshold.classList.add("dragging");
         function onMove(e) {
@@ -455,6 +532,7 @@
 
     // Tap anywhere on the meter bar to set threshold
     meterContainer.addEventListener("click", function(e) {
+        if (isSquelchLocked()) return;
         if (e.target === meterThreshold) return;
         applySquelch(posToDb(e.clientX));
     });
@@ -482,6 +560,7 @@
     }
 
     function applyGain(val) {
+        if (isGainLocked()) return;
         ensureAudioCtxRunning();
         gainSlider._userSet = true;
         clearTimeout(gainDebounce);
@@ -500,6 +579,7 @@
 
     // Mouse drag
     gainThumb.addEventListener("mousedown", function(e) {
+        if (isGainLocked()) return;
         e.preventDefault();
         gainThumb.classList.add("dragging");
         function onMove(e) { applyGain(gainPosToVal(e.clientX)); }
@@ -514,6 +594,7 @@
 
     // Touch drag
     gainThumb.addEventListener("touchstart", function(e) {
+        if (isGainLocked()) return;
         e.preventDefault();
         gainThumb.classList.add("dragging");
         function onMove(e) {
@@ -532,6 +613,7 @@
 
     // Tap on track
     gainTrack.addEventListener("click", function(e) {
+        if (isGainLocked()) return;
         if (e.target === gainThumb) return;
         applyGain(gainPosToVal(e.clientX));
     });
@@ -684,17 +766,545 @@
         }
     });
 
-    // ── Init ───────────────────────────────────────────
-    fetch("/api/channels")
-        .then(function(r) { return r.json(); })
-        .then(function(chs) {
-            channels = chs;
-            if (channels.length > 0) {
-                currentChannelId = channels[0].id;
-                renderChannelTabs();
-                switchChannel(currentChannelId);
+    // ══════════════════════════════════════════════════════
+    // ── SETTINGS MODAL ───────────────────────────────────
+    // ══════════════════════════════════════════════════════
+
+    var restartBtn = document.getElementById("restartBtn");
+    var settingsBanner = document.getElementById("settingsBanner");
+
+    // Wire modal open callback into the inline modal code
+    window.SDR._onModalOpen = function(openAddForm) {
+        fetchRuntime().then(function() {
+            return Promise.all([loadChannelsTab(), loadSettingsTab()]);
+        }).then(function() {
+            if (openAddForm) {
+                openAddChannelForm();
             }
+        });
+    };
+
+    // Restart
+    restartBtn.addEventListener("click", function() {
+        if (!confirm("Restart SDR Monitor? Active recordings will be finalized.")) return;
+        restartBtn.disabled = true;
+        restartBtn.textContent = "Restarting...";
+        fetch("/api/restart", { method: "POST" })
+            .then(function() {
+                showBanner("Restarting \u2014 page will reload...", "success");
+                setTimeout(function() { location.reload(); }, 3000);
+            })
+            .catch(function() {
+                showBanner("Restart failed", "error");
+                restartBtn.disabled = false;
+                restartBtn.textContent = "Restart";
+            });
+    });
+
+    function showBanner(msg, type) {
+        settingsBanner.textContent = msg;
+        settingsBanner.className = "settings-banner " + type;
+        settingsBanner.style.display = "";
+        setTimeout(function() { settingsBanner.style.display = "none"; }, 4000);
+    }
+
+    // ── Channels Tab ─────────────────────────────────────
+
+    var channelTableBody = document.getElementById("channelTableBody");
+    var channelFormWrap = document.getElementById("channelFormWrap");
+    var addChannelBtn = document.getElementById("addChannelBtn");
+    var channelFormTitle = document.getElementById("channelFormTitle");
+    var channelFormErrors = document.getElementById("channelFormErrors");
+    var cfId = document.getElementById("cfId");
+    var cfName = document.getElementById("cfName");
+    var cfFreq = document.getElementById("cfFreq");
+    var cfDcs = document.getElementById("cfDcs");
+    var cfMode = document.getElementById("cfMode");
+    var cfSquelch = document.getElementById("cfSquelch");
+    var cfSave = document.getElementById("cfSave");
+    var cfCancel = document.getElementById("cfCancel");
+
+    var editingChannelId = null; // null = add mode, string = edit mode
+    var pendingStartup = null;  // null = no pending changes, array = pending set
+    var savedStartup = [];      // last known saved startup_channels
+
+    var startupActions = document.getElementById("startupActions");
+    var saveStartupBtn = document.getElementById("saveStartupBtn");
+    var revertStartupBtn = document.getElementById("revertStartupBtn");
+
+    function loadChannelsTab() {
+        // Receiver info bar
+        var bar = document.getElementById("receiverInfoBar");
+        if (runtimeState && runtimeState.receiver) {
+            var r = runtimeState.receiver;
+            bar.textContent = "RTL-SDR #" + r.device_index + " \u2014 " +
+                (r.sample_rate / 1000) + " kHz \u2014 max " + r.max_channels + " channels";
+        } else {
+            bar.textContent = "Receiver info unavailable";
+        }
+
+        // Load config
+        return fetch("/api/config")
+            .then(function(r) { return r.json(); })
+            .then(function(cfg) {
+                renderChannelTable(cfg);
+                renderSessionInfo(cfg);
+            })
+            .catch(function() {
+                channelTableBody.innerHTML = '<tr><td colspan="9">Error loading config</td></tr>';
+            });
+    }
+
+    function renderSessionInfo(cfg) {
+        var info = document.getElementById("sessionInfo");
+        var running = runtimeState ? runtimeState.running_channels : [];
+        var startup = cfg.startup_channels || [];
+        info.innerHTML =
+            '<span class="label">Current session:</span> <span class="value">' +
+            (running.length ? running.join(", ") : "none") + '</span><br>' +
+            '<span class="label">Saved startup set:</span> <span class="value">' +
+            (startup.length ? startup.join(", ") : "none") + '</span>';
+    }
+
+    function renderChannelTable(cfg) {
+        channelTableBody.innerHTML = "";
+        var chMap = cfg.channels || {};
+        var running = runtimeState ? runtimeState.running_channels : [];
+        savedStartup = (cfg.startup_channels || []).slice();
+        var displayStartup = pendingStartup || savedStartup;
+        var ids = Object.keys(chMap);
+
+        ids.forEach(function(id) {
+            var ch = chMap[id];
+            var isRunning = running.indexOf(id) >= 0;
+            var isStartup = displayStartup.indexOf(id) >= 0;
+
+            var tr = document.createElement("tr");
+
+            // Startup checkbox
+            var tdStart = document.createElement("td");
+            tdStart.className = "ch-col-startup";
+            var cb = document.createElement("input");
+            cb.type = "checkbox";
+            cb.checked = isStartup;
+            cb.title = "Include in startup set";
+            cb.addEventListener("change", function() {
+                handleStartupToggle(id, cb.checked);
+            });
+            tdStart.appendChild(cb);
+            tr.appendChild(tdStart);
+
+            // ID
+            var tdId = document.createElement("td");
+            tdId.textContent = id;
+            tr.appendChild(tdId);
+
+            // Name
+            var tdName = document.createElement("td");
+            tdName.textContent = ch.name || "";
+            tr.appendChild(tdName);
+
+            // Freq
+            var tdFreq = document.createElement("td");
+            var freqText = ch.freq_hz ? (ch.freq_hz / 1e6).toFixed(4) : "";
+            if (isRunning) {
+                tdFreq.className = "field-locked";
+            }
+            tdFreq.textContent = freqText;
+            tr.appendChild(tdFreq);
+
+            // DCS
+            var tdDcs = document.createElement("td");
+            if (isRunning) tdDcs.className = "field-locked";
+            tdDcs.textContent = String(ch.dcs_code || 0).padStart(3, "0");
+            tr.appendChild(tdDcs);
+
+            // Mode
+            var tdMode = document.createElement("td");
+            if (isRunning) tdMode.className = "field-locked";
+            tdMode.textContent = ch.dcs_mode || "advisory";
+            tr.appendChild(tdMode);
+
+            // Squelch
+            var tdSq = document.createElement("td");
+            tdSq.textContent = (ch.squelch != null) ? ch.squelch : "-45.0";
+            tr.appendChild(tdSq);
+
+            // Status
+            var tdStatus = document.createElement("td");
+            if (isRunning) {
+                var badge = document.createElement("span");
+                badge.className = "status-badge running";
+                badge.textContent = "RUNNING";
+                tdStatus.appendChild(badge);
+            } else if (isStartup) {
+                var badge = document.createElement("span");
+                badge.className = "status-badge startup";
+                badge.textContent = "STARTUP";
+                tdStatus.appendChild(badge);
+            }
+            tr.appendChild(tdStatus);
+
+            // Actions
+            var tdAct = document.createElement("td");
+
+            var editBtn = document.createElement("button");
+            editBtn.className = "ch-action-btn";
+            editBtn.textContent = "\u270E";
+            editBtn.title = "Edit";
+            editBtn.addEventListener("click", function() {
+                openEditForm(id, ch, isRunning);
+            });
+            tdAct.appendChild(editBtn);
+
+            if (!isRunning) {
+                var delBtn = document.createElement("button");
+                delBtn.className = "ch-action-btn delete";
+                delBtn.textContent = "\u2716";
+                delBtn.title = "Delete";
+                delBtn.addEventListener("click", function() {
+                    if (!confirm("Delete channel '" + id + "'?")) return;
+                    fetch("/api/config/channels/" + id, { method: "DELETE" })
+                        .then(function(r) { return r.json(); })
+                        .then(function(res) {
+                            if (res.error) {
+                                showBanner(res.error, "error");
+                            } else {
+                                showBanner("Channel deleted", "success");
+                                loadChannelsTab();
+                            }
+                        });
+                });
+                tdAct.appendChild(delBtn);
+            }
+
+            tr.appendChild(tdAct);
+            channelTableBody.appendChild(tr);
+        });
+    }
+
+    function handleStartupToggle(chId, checked) {
+        var current = (pendingStartup || savedStartup).slice();
+        if (checked) {
+            if (current.indexOf(chId) < 0) current.push(chId);
+        } else {
+            current = current.filter(function(id) { return id !== chId; });
+        }
+        pendingStartup = current;
+        updateStartupActions();
+    }
+
+    function updateStartupActions() {
+        var changed = pendingStartup !== null &&
+            (pendingStartup.length !== savedStartup.length ||
+             pendingStartup.some(function(id) { return savedStartup.indexOf(id) < 0; }));
+        startupActions.style.display = changed ? "" : "none";
+    }
+
+    saveStartupBtn.addEventListener("click", function() {
+        if (!pendingStartup) return;
+        saveStartupBtn.disabled = true;
+        saveStartupBtn.textContent = "Saving...";
+        fetch("/api/config/startup_channels", {
+            method: "PUT",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ channels: pendingStartup }),
         })
-        .catch(function() {});
+            .then(function(r) { return r.json(); })
+            .then(function(res) {
+                saveStartupBtn.disabled = false;
+                saveStartupBtn.textContent = "Save Startup Set";
+                if (res.error) {
+                    showBanner(res.error, "error");
+                } else {
+                    savedStartup = pendingStartup.slice();
+                    pendingStartup = null;
+                    updateStartupActions();
+                    showRestartBanner("Startup set saved");
+                }
+                loadChannelsTab();
+            });
+    });
+
+    revertStartupBtn.addEventListener("click", function() {
+        pendingStartup = null;
+        updateStartupActions();
+        loadChannelsTab();
+    });
+
+    function showRestartBanner(msg) {
+        settingsBanner.innerHTML = msg + ' \u2014 <a href="#" id="bannerRestart">Restart now</a> to apply';
+        settingsBanner.className = "settings-banner success";
+        settingsBanner.style.display = "";
+        document.getElementById("bannerRestart").addEventListener("click", function(e) {
+            e.preventDefault();
+            fetch("/api/restart", { method: "POST" }).then(function() {
+                settingsBanner.textContent = "Restarting \u2014 page will reload...";
+                setTimeout(function() { location.reload(); }, 3000);
+            });
+        });
+    }
+
+    // ── Channel form (add/edit) ──────────────────────────
+
+    function openAddChannelForm() {
+        editingChannelId = null;
+        channelFormTitle.textContent = "Add Channel";
+        channelFormErrors.textContent = "";
+        cfId.value = "";
+        cfId.disabled = false;
+        cfName.value = "";
+        cfFreq.value = "";
+        cfDcs.value = "0";
+        cfMode.value = "advisory";
+        cfSquelch.value = "-45";
+        cfFreq.disabled = false;
+        cfDcs.disabled = false;
+        cfMode.disabled = false;
+        channelFormWrap.style.display = "";
+        addChannelBtn.style.display = "none";
+    }
+
+    addChannelBtn.addEventListener("click", function() {
+        openAddChannelForm();
+    });
+
+    function openEditForm(id, ch, isRunning) {
+        editingChannelId = id;
+        channelFormTitle.textContent = "Edit Channel: " + id;
+        channelFormErrors.textContent = "";
+        cfId.value = id;
+        cfId.disabled = true;
+        cfName.value = ch.name || "";
+        cfFreq.value = ch.freq_hz ? (ch.freq_hz / 1e6).toFixed(6) : "";
+        cfDcs.value = ch.dcs_code || 0;
+        cfMode.value = ch.dcs_mode || "advisory";
+        cfSquelch.value = (ch.squelch != null) ? ch.squelch : -45;
+        cfFreq.disabled = isRunning;
+        cfDcs.disabled = isRunning;
+        cfMode.disabled = isRunning;
+        channelFormWrap.style.display = "";
+        addChannelBtn.style.display = "none";
+    }
+
+    cfCancel.addEventListener("click", function() {
+        channelFormWrap.style.display = "none";
+        addChannelBtn.style.display = "";
+    });
+
+    cfSave.addEventListener("click", function() {
+        channelFormErrors.textContent = "";
+
+        var freqMhz = parseFloat(cfFreq.value);
+        var freqHz = Math.round(freqMhz * 1e6);
+        var dcsCode = parseInt(cfDcs.value) || 0;
+        var squelch = parseFloat(cfSquelch.value);
+
+        // Client-side validation
+        var errors = [];
+        if (!editingChannelId && !cfId.value.match(/^[a-zA-Z0-9_-]+$/)) {
+            errors.push("ID: must match [a-zA-Z0-9_-]+");
+        }
+        if (!cfName.value.trim()) errors.push("Name: required");
+        if (isNaN(freqHz) || freqHz < 1000000 || freqHz > 6000000000) {
+            errors.push("Freq: must be 1-6000 MHz");
+        }
+        if (isNaN(squelch) || squelch < -70 || squelch > -5) {
+            errors.push("Squelch: must be -70 to -5");
+        }
+        if (errors.length) {
+            channelFormErrors.textContent = errors.join(" | ");
+            return;
+        }
+
+        var body = {
+            name: cfName.value.trim(),
+            freq_hz: freqHz,
+            dcs_code: dcsCode,
+            dcs_mode: cfMode.value,
+            squelch: squelch,
+        };
+
+        var url, method;
+        if (editingChannelId) {
+            url = "/api/config/channels/" + editingChannelId;
+            method = "PUT";
+        } else {
+            body.id = cfId.value.trim();
+            url = "/api/config/channels";
+            method = "POST";
+        }
+
+        fetch(url, {
+            method: method,
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(body),
+        })
+            .then(function(r) { return r.json(); })
+            .then(function(res) {
+                if (res.errors) {
+                    var msgs = Object.entries(res.errors).map(function(e) {
+                        return e[0] + ": " + e[1];
+                    });
+                    channelFormErrors.textContent = msgs.join(" | ");
+                } else if (res.error) {
+                    channelFormErrors.textContent = res.error;
+                } else {
+                    channelFormWrap.style.display = "none";
+                    addChannelBtn.style.display = "";
+                    showRestartBanner(editingChannelId ? "Channel updated" : "Channel created");
+                    loadChannelsTab();
+                }
+            });
+    });
+
+    // ── Settings Tab ─────────────────────────────────────
+
+    var SETTINGS_META = {
+        gain:            { label: "RF Gain",         type: "number", step: 1,   min: 0,  max: 50,    timing: "Applies immediately" },
+        default_squelch: { label: "Default Squelch",  type: "number", step: 0.5, min: -70, max: -5,   timing: "Applied on restart (new channels only)" },
+        audio_preset:    { label: "Audio Preset",     type: "choice", choices: ["conservative", "aggressive", "flat"], timing: "Applied on restart" },
+        tau:             { label: "FM De-emphasis",    type: "number", step: 0.000001, min: 0, max: 1, timing: "Applied on restart" },
+        record:          { label: "Record",           type: "bool",   timing: "Applied on restart" },
+        max_audio_mb:    { label: "Max Audio MB",     type: "number", step: 1,   min: 10, max: 100000, timing: "Applied on restart" },
+        tx_tail:         { label: "TX Tail (s)",      type: "number", step: 0.5, min: 0.5, max: 30,   timing: "Applied on restart" },
+        log_days:        { label: "Log Days",         type: "number", step: 1,   min: 1,  max: 365,   timing: "Applied on restart" },
+    };
+
+    function loadSettingsTab() {
+        var fields = document.getElementById("settingsFields");
+        fields.innerHTML = "";
+
+        return fetch("/api/config")
+            .then(function(r) { return r.json(); })
+            .then(function(cfg) {
+                var saved = cfg.settings || {};
+                var eff = runtimeState ? runtimeState.effective_settings : {};
+
+                Object.keys(SETTINGS_META).forEach(function(key) {
+                    var meta = SETTINGS_META[key];
+                    var effInfo = eff[key] || {};
+                    var value = effInfo.value != null ? effInfo.value : (saved[key] != null ? saved[key] : "");
+                    var source = effInfo.source || "default";
+                    var locked = effInfo.locked || false;
+
+                    var row = document.createElement("div");
+                    row.className = "setting-row";
+
+                    // Label
+                    var lbl = document.createElement("div");
+                    lbl.className = "setting-label";
+                    lbl.textContent = meta.label;
+                    row.appendChild(lbl);
+
+                    // Input
+                    var inp = document.createElement("div");
+                    inp.className = "setting-input";
+                    var el;
+
+                    if (meta.type === "choice") {
+                        el = document.createElement("select");
+                        meta.choices.forEach(function(c) {
+                            var opt = document.createElement("option");
+                            opt.value = c;
+                            opt.textContent = c;
+                            if (c === value) opt.selected = true;
+                            el.appendChild(opt);
+                        });
+                    } else if (meta.type === "bool") {
+                        el = document.createElement("select");
+                        var optT = document.createElement("option");
+                        optT.value = "true"; optT.textContent = "true";
+                        var optF = document.createElement("option");
+                        optF.value = "false"; optF.textContent = "false";
+                        if (value === true) optT.selected = true;
+                        else optF.selected = true;
+                        el.appendChild(optT);
+                        el.appendChild(optF);
+                    } else {
+                        el = document.createElement("input");
+                        el.type = "number";
+                        el.step = meta.step;
+                        el.min = meta.min;
+                        el.max = meta.max;
+                        el.value = value;
+                    }
+
+                    el.dataset.key = key;
+                    el.className = "setting-control";
+                    if (locked) el.disabled = true;
+                    inp.appendChild(el);
+                    row.appendChild(inp);
+
+                    // Source badge
+                    var badge = document.createElement("span");
+                    badge.className = "source-badge " + source;
+                    badge.textContent = source;
+                    row.appendChild(badge);
+
+                    // Timing
+                    var timing = document.createElement("span");
+                    timing.className = "apply-timing";
+                    timing.textContent = meta.timing;
+                    row.appendChild(timing);
+
+                    fields.appendChild(row);
+                });
+            });
+    }
+
+    document.getElementById("settingsSaveBtn").addEventListener("click", function() {
+        var controls = document.querySelectorAll("#settingsFields .setting-control");
+        var body = {};
+        controls.forEach(function(el) {
+            var key = el.dataset.key;
+            if (el.disabled) return;
+            var meta = SETTINGS_META[key];
+            if (meta.type === "number") {
+                body[key] = parseFloat(el.value);
+            } else if (meta.type === "bool") {
+                body[key] = el.value === "true";
+            } else {
+                body[key] = el.value;
+            }
+        });
+
+        document.getElementById("settingsFormErrors").textContent = "";
+
+        fetch("/api/config/settings", {
+            method: "PUT",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(body),
+        })
+            .then(function(r) { return r.json(); })
+            .then(function(res) {
+                if (res.errors) {
+                    var msgs = Object.entries(res.errors).map(function(e) {
+                        return e[0] + ": " + e[1];
+                    });
+                    document.getElementById("settingsFormErrors").textContent = msgs.join(" | ");
+                } else if (res.error) {
+                    document.getElementById("settingsFormErrors").textContent = res.error;
+                } else {
+                    showBanner("Settings saved", "success");
+                    loadSettingsTab();
+                }
+            });
+    });
+
+    // ── Init ───────────────────────────────────────────
+    Promise.all([
+        fetch("/api/channels").then(function(r) { return r.json(); }),
+        fetchRuntime(),
+    ]).then(function(results) {
+        channels = results[0] || [];
+        if (channels.length > 0) {
+            currentChannelId = channels[0].id;
+            renderChannelTabs();
+            switchChannel(currentChannelId);
+        } else {
+            renderChannelTabs();
+        }
+    }).catch(function() {});
 
 })();

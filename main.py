@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """SDR Monitor — CLI entry point.
 
-Multi-channel NFM SDR monitor with configurable channels loaded
-from YAML config files. Monitors up to N channels simultaneously
-on a single RTL-SDR receiver.
+Multi-channel NFM SDR monitor. Channels loaded from config.yaml
+(consolidated channel database). Monitors up to N channels
+simultaneously on a single RTL-SDR receiver.
 """
 
 import dataclasses
@@ -16,15 +16,15 @@ import time
 
 import click
 import uvicorn
-import yaml
 
 from config import (
     FREQ_HZ, RF_GAIN, SQUELCH_THRESHOLD_DB,
     MAX_AUDIO_MB, WEB_HOST, WEB_PORT, TX_ENDING_TIMEOUT_S,
     DEFAULT_AUDIO_PRESET, FM_TAU,
-    CHANNEL_NAME, DCS_CODE,
+    CHANNEL_NAME, DCS_CODE, CHANNEL_RATE,
     DEFAULT_RECEIVER, Receiver, ResolvedPaths,
-    resolve_paths, resolve_channel_configs, validate_channel_id,
+    resolve_paths, validate_channel_id, load_config,
+    validate_channel, validate_settings,
 )
 
 
@@ -40,219 +40,180 @@ class ChannelStack:
     paths: ResolvedPaths
 
 
-def _load_channel_yaml(config_path):
-    """Load channel configuration from YAML file.
-
-    Returns a dict with keys: name, freq_hz, dcs_code, dcs_mode.
-    Returns empty dict if file is missing (with warning).
-    Exits on invalid YAML or invalid values.
-    """
-    if not os.path.isfile(config_path):
-        click.echo(f"Warning: channel config '{config_path}' not found, using defaults.")
-        return {}
-
-    try:
-        with open(config_path) as f:
-            data = yaml.safe_load(f)
-    except yaml.YAMLError as e:
-        click.echo(f"Error: invalid YAML in '{config_path}': {e}", err=True)
-        sys.exit(1)
-
-    if not isinstance(data, dict):
-        click.echo(f"Error: '{config_path}' must contain a YAML mapping.", err=True)
-        sys.exit(1)
-
-    return data
-
-
-def _validate_channel_config(cfg):
-    """Validate merged channel config. Exits on invalid values."""
-    # freq_hz
-    freq = cfg.get("freq_hz")
-    if not isinstance(freq, int) or freq < 1_000_000 or freq > 6_000_000_000:
-        click.echo(f"Error: freq_hz must be an integer between 1 MHz and 6 GHz, got: {freq}", err=True)
-        sys.exit(1)
-
-    # dcs_code — decimal representation of octal digits
-    code = cfg.get("dcs_code")
-    if not isinstance(code, int) or code < 0:
-        click.echo(f"Error: dcs_code must be a non-negative integer, got: {code}", err=True)
-        sys.exit(1)
-    padded = f"{code:03d}"
-    if len(padded) > 3:
-        click.echo(f"Error: dcs_code must be 1-3 digits, got: {code}", err=True)
-        sys.exit(1)
-    for ch in padded:
-        if ch not in "01234567":
-            click.echo(f"Error: dcs_code digits must be 0-7 (octal), got: {code}", err=True)
-            sys.exit(1)
-
-    # name
-    name = cfg.get("name", "")
-    if not isinstance(name, str) or len(name.strip()) == 0:
-        click.echo(f"Error: name must be a non-empty string.", err=True)
-        sys.exit(1)
-    if len(name) > 64:
-        click.echo(f"Error: name must be at most 64 characters, got {len(name)}.", err=True)
-        sys.exit(1)
-
-    # dcs_mode
-    mode = cfg.get("dcs_mode", "advisory")
-    if mode not in ("advisory", "strict"):
-        click.echo(f"Error: dcs_mode must be 'advisory' or 'strict', got: {mode}", err=True)
-        sys.exit(1)
-
-
-def _handle_init_channel(channel_id, paths):
-    """Create a channel config from template."""
-    cid = channel_id or "default"
-    validate_channel_id(cid)
-
-    os.makedirs(paths.channels_dir, exist_ok=True)
-    dest = os.path.join(paths.channels_dir, f"{cid}.yaml")
-    if os.path.exists(dest):
-        click.echo(f"Error: {dest} already exists.", err=True)
-        sys.exit(1)
-
-    template = os.path.join(os.path.dirname(__file__), "examples", "channel_template.yaml")
-    if not os.path.isfile(template):
-        click.echo(f"Error: template not found at {template}", err=True)
-        sys.exit(1)
-
-    import shutil
-    shutil.copy2(template, dest)
-    click.echo(f"Created {dest}")
-    click.echo(f"Edit it to configure your channel, then run: python main.py -c {cid}")
-
-
-def _handle_list_channels(paths):
-    """List available channel configs."""
-    if not os.path.isdir(paths.channels_dir):
-        click.echo(f"No channels directory found at {paths.channels_dir}")
-        click.echo("Run: python main.py --init-channel <id>")
-        return
-
-    import glob as globmod
-    files = sorted(globmod.glob(os.path.join(paths.channels_dir, "*.yaml")))
-    if not files:
-        click.echo(f"No channel configs found in {paths.channels_dir}")
-        click.echo("Run: python main.py --init-channel <id>")
-        return
-
-    click.echo(f"Available channels in {paths.channels_dir}:")
-    for f in files:
-        stem = os.path.splitext(os.path.basename(f))[0]
-        click.echo(f"  {stem}")
-
-
 @click.command()
 @click.option("--channel", "-c", "channel_ids", multiple=True, type=str,
-              help="Channel ID (loads from ~/.config/sdr-rx/channels/<id>.yaml). Repeatable.")
-@click.option("--gain", "-g", default=RF_GAIN, show_default=True,
-              help="RTL-SDR tuner gain (dB).")
-@click.option("--squelch", "-s", default=SQUELCH_THRESHOLD_DB, show_default=True,
-              type=float, help="RF power squelch threshold (dB).")
-@click.option("--record/--no-record", "-r/-R", default=True, show_default=True,
+              help="Channel ID to monitor (from config.yaml). Repeatable. Overrides startup_channels.")
+@click.option("--gain", "-g", default=None, type=float,
+              help="RTL-SDR tuner gain (dB). Overrides config.")
+@click.option("--squelch", "-s", default=None, type=float,
+              help="RF power squelch threshold (dB). Overrides all channels for this run.")
+@click.option("--record/--no-record", "-r/-R", default=None,
               help="Record transmissions to WAV files.")
-@click.option("--max-audio-mb", default=MAX_AUDIO_MB, show_default=True,
+@click.option("--max-audio-mb", default=None, type=int,
               help="Max audio folder size in MB.")
 @click.option("--port", "-p", default=WEB_PORT, show_default=True,
               help="Web dashboard port.")
 @click.option("--host", default=WEB_HOST, show_default=True,
               help="Web dashboard bind address.")
-@click.option("--tx-tail", default=TX_ENDING_TIMEOUT_S, show_default=True,
-              type=float, help="Seconds of squelch-closed before ending TX (merges short gaps).")
+@click.option("--tx-tail", default=None, type=float,
+              help="Seconds of squelch-closed before ending TX.")
 @click.option("--audio-preset", type=click.Choice(["conservative", "aggressive", "flat"]),
-              default=DEFAULT_AUDIO_PRESET, show_default=True,
-              help="Voice audio processing preset.")
+              default=None, help="Voice audio processing preset.")
 @click.option("--tau", default=None, type=float,
-              help="FM de-emphasis time constant (seconds). 0=none (LMR default), 75e-6=broadcast FM. Omit to use default.")
+              help="FM de-emphasis time constant (seconds). 0=none.")
 @click.option("--data-dir", default=None, type=str,
               help="Override data directory (default: ~/.local/share/sdr-rx).")
-@click.option("--list-channels", is_flag=True, default=False,
-              help="List available channel configs and exit.")
-@click.option("--init-channel", "init_channel_id", default=None, type=str, is_eager=True,
-              is_flag=False, flag_value="default",
-              help="Create a channel config from template and exit. Defaults to 'default'.")
-def main(channel_ids, gain, squelch,
+@click.pass_context
+def main(ctx, channel_ids, gain, squelch,
          record, max_audio_mb, port, host, tx_tail, audio_preset, tau,
-         data_dir, list_channels, init_channel_id):
+         data_dir):
     """SDR Monitor — GNU Radio + Web Dashboard.
 
     \b
     Monitors configurable NFM channels using RTL-SDR with
     RF power squelch, DCS decoding, and a web dashboard.
-    Channel settings are loaded from YAML config files.
+    Channel settings are loaded from config.yaml.
 
     \b
     Examples:
-      python main.py -c my_channel                    # monitor one channel
-      python main.py -c ch1 -c ch2                    # monitor two channels
-      python main.py -c ch1 -c ch2 -g 30 -s -25      # custom gain and squelch
-      python main.py --init-channel myradio           # create new channel config
-      python main.py --list-channels                  # show available channels
+      python main.py                                    # use startup_channels from config
+      python main.py -c frs1                            # override: monitor frs1
+      python main.py -c frs1 -c frs20                   # monitor two channels
+      python main.py -c frs1 -g 30 -s -25               # custom gain and squelch
     """
 
-    # ── Short-circuit commands (no hardware needed) ──
+    # ── Load config ──
     pre_paths = resolve_paths(data_dir_override=data_dir)
+    config_dir = pre_paths.config_dir
+    cfg = load_config(config_dir)
+    settings = cfg["settings"]
 
-    if init_channel_id is not None:
-        _handle_init_channel(init_channel_id or None, pre_paths)
-        return
+    # ── Build CLI overrides dict ──
+    # Track which fields were explicitly passed via CLI
+    cli_overrides = {}
 
-    if list_channels:
-        _handle_list_channels(pre_paths)
-        return
+    def _is_cli_set(param_name):
+        src = ctx.get_parameter_source(param_name)
+        return src is not None and src != click.core.ParameterSource.DEFAULT
 
-    # ── Run mode: require at least one channel ──
-    if not channel_ids:
-        click.echo("Error: at least one -c/--channel is required.", err=True)
-        click.echo("  Tip: python main.py -c <channel_id>", err=True)
-        click.echo("  Run 'python main.py --list-channels' to see available channels.", err=True)
+    if _is_cli_set("gain"):
+        cli_overrides["gain"] = gain
+    if _is_cli_set("squelch"):
+        cli_overrides["squelch"] = squelch
+    if _is_cli_set("record"):
+        cli_overrides["record"] = record
+    if _is_cli_set("max_audio_mb"):
+        cli_overrides["max_audio_mb"] = max_audio_mb
+    if _is_cli_set("tx_tail"):
+        cli_overrides["tx_tail"] = tx_tail
+    if _is_cli_set("audio_preset"):
+        cli_overrides["audio_preset"] = audio_preset
+    if _is_cli_set("tau"):
+        cli_overrides["tau"] = tau
+
+    # ── Validate persisted settings ──
+    settings_errors = validate_settings(settings)
+    if settings_errors:
+        click.echo("Error: invalid settings in config.yaml:", err=True)
+        for field, msg in settings_errors.items():
+            click.echo(f"  {field}: {msg}", err=True)
         sys.exit(1)
 
-    # ── Resolve and validate all channels ──
-    receiver = DEFAULT_RECEIVER
-    resolved = resolve_channel_configs(
-        channel_ids, pre_paths.channels_dir, receiver.max_channels,
-    )
+    # ── Resolve effective settings ──
+    eff_gain = cli_overrides.get("gain", settings.get("gain", RF_GAIN))
+    eff_squelch = cli_overrides.get("squelch", None)  # None = use per-channel
+    eff_record = cli_overrides.get("record", settings.get("record", True))
+    eff_max_audio = cli_overrides.get("max_audio_mb", settings.get("max_audio_mb", MAX_AUDIO_MB))
+    eff_tx_tail = cli_overrides.get("tx_tail", settings.get("tx_tail", TX_ENDING_TIMEOUT_S))
+    eff_preset = cli_overrides.get("audio_preset", settings.get("audio_preset", DEFAULT_AUDIO_PRESET))
+    eff_tau = cli_overrides.get("tau", settings.get("tau", FM_TAU))
+    eff_log_days = settings.get("log_days", 7)
 
-    # Apply tx-tail to config
+    # Apply tx-tail to config module
     import config
-    config.TX_ENDING_TIMEOUT_S = tx_tail
-    config.TX_ENDING_POLLS = int(tx_tail * config.POLL_RATE_HZ)
+    config.TX_ENDING_TIMEOUT_S = eff_tx_tail
+    config.TX_ENDING_POLLS = int(eff_tx_tail * config.POLL_RATE_HZ)
 
-    # ── Load and validate each channel config ──
-    channel_cfgs = []  # list of (channel_id, channel_cfg_dict, paths)
-    for channel_id, config_path in resolved:
-        paths = resolve_paths(data_dir_override=data_dir, channel_id=channel_id)
+    # ── Determine channels to monitor ──
+    receiver = DEFAULT_RECEIVER
+    all_channels = cfg.get("channels", {})
 
-        channel_cfg = {
-            "name": CHANNEL_NAME,
-            "freq_hz": FREQ_HZ,
-            "dcs_code": DCS_CODE,
-            "dcs_mode": "advisory",
-        }
+    if channel_ids:
+        # CLI overrides startup_channels
+        selected_ids = list(channel_ids)
+    else:
+        selected_ids = cfg.get("startup_channels", [])
 
-        yaml_data = _load_channel_yaml(config_path)
-        for key in ("name", "freq_hz", "dcs_code", "dcs_mode"):
-            if key in yaml_data:
-                channel_cfg[key] = yaml_data[key]
+    if not selected_ids:
+        click.echo("Error: no channels to monitor.", err=True)
+        click.echo("  Tip: python main.py -c <channel_id>", err=True)
+        click.echo("  Or set startup_channels in config.yaml", err=True)
+        sys.exit(1)
 
-        _validate_channel_config(channel_cfg)
+    if len(selected_ids) > receiver.max_channels:
+        click.echo(f"Error: too many channels ({len(selected_ids)}). "
+                   f"Max {receiver.max_channels} per receiver.", err=True)
+        sys.exit(1)
 
+    # Check duplicates
+    seen = set()
+    for cid in selected_ids:
+        if cid in seen:
+            click.echo(f"Error: duplicate channel ID '{cid}'.", err=True)
+            sys.exit(1)
+        seen.add(cid)
+
+    # Resolve channel configs
+    channel_cfgs = []
+    for cid in selected_ids:
+        validate_channel_id(cid)
+        if cid not in all_channels:
+            click.echo(f"Error: channel '{cid}' not found in config.", err=True)
+            sys.exit(1)
+
+        ch_cfg = dict(all_channels[cid])
+        # Apply defaults for missing fields
+        ch_cfg.setdefault("name", CHANNEL_NAME)
+        ch_cfg.setdefault("freq_hz", FREQ_HZ)
+        ch_cfg.setdefault("dcs_code", DCS_CODE)
+        ch_cfg.setdefault("dcs_mode", "advisory")
+        ch_cfg.setdefault("squelch", settings.get("default_squelch", SQUELCH_THRESHOLD_DB))
+
+        # Validate channel config
+        ch_errors = validate_channel(ch_cfg)
+        if ch_errors:
+            click.echo(f"Error: invalid config for channel '{cid}':", err=True)
+            for field, msg in ch_errors.items():
+                click.echo(f"  {field}: {msg}", err=True)
+            sys.exit(1)
+
+        # CLI squelch override applies to all channels
+        if eff_squelch is not None:
+            ch_cfg["squelch"] = eff_squelch
+
+        paths = resolve_paths(data_dir_override=data_dir, channel_id=cid)
         os.makedirs(paths.channel_data_dir, exist_ok=True)
-        if record:
+        if eff_record:
             os.makedirs(paths.audio_dir, exist_ok=True)
 
-        channel_cfgs.append((channel_id, channel_cfg, paths))
+        channel_cfgs.append((cid, ch_cfg, paths))
 
-    tau_display = f"{tau}" if tau is not None else f"{FM_TAU} (default)"
+    # ── Bandwidth validation ──
+    if len(channel_cfgs) > 1:
+        freqs = [cfg["freq_hz"] for _, cfg, _ in channel_cfgs]
+        spread = max(freqs) - min(freqs)
+        max_spread = receiver.sample_rate - CHANNEL_RATE
+        if spread > max_spread:
+            click.echo(f"Error: channel frequency spread {spread/1e3:.1f} kHz exceeds "
+                       f"usable bandwidth {max_spread/1e3:.1f} kHz.", err=True)
+            sys.exit(1)
+
+    tau_display = f"{eff_tau}" if eff_tau else f"{FM_TAU} (default)"
     click.echo(f"Starting {len(channel_cfgs)} channel(s)...")
-    for cid, cfg, paths in channel_cfgs:
-        click.echo(f"  [{cid}] {cfg['name']} — {cfg['freq_hz']/1e6:.3f} MHz, DCS {cfg['dcs_code']:03d} ({cfg['dcs_mode']})")
-    click.echo(f"  Gain: {gain} | Squelch: {squelch} dB | Record: {'ON' if record else 'OFF'} | TX tail: {tx_tail}s")
-    click.echo(f"  Web: http://{host}:{port} | Audio: {audio_preset} preset | tau: {tau_display}")
+    for cid, cfg_ch, paths in channel_cfgs:
+        click.echo(f"  [{cid}] {cfg_ch['name']} — {cfg_ch['freq_hz']/1e6:.3f} MHz, DCS {cfg_ch['dcs_code']:03d} ({cfg_ch['dcs_mode']})")
+    click.echo(f"  Gain: {eff_gain} | Squelch: {eff_squelch or 'per-channel'} | Record: {'ON' if eff_record else 'OFF'} | TX tail: {eff_tx_tail}s")
+    click.echo(f"  Web: http://{host}:{port} | Audio: {eff_preset} preset | tau: {tau_display}")
 
     click.echo("Loading GNU Radio modules...")
     from gr_engine import ReceiverFlowgraph, ChannelConfig
@@ -273,7 +234,7 @@ def main(channel_ids, gain, squelch,
         channel_configs.append(ChannelConfig(
             channel_id=channel_id,
             freq_hz=channel_cfg["freq_hz"],
-            squelch_threshold=squelch,
+            squelch_threshold=channel_cfg["squelch"],
             audio_tap=audio_tap,
             dcs_decoder=dcs_decoder,
         ))
@@ -293,9 +254,9 @@ def main(channel_ids, gain, squelch,
     flowgraph = ReceiverFlowgraph(
         channels=channel_configs,
         receiver=receiver,
-        gain=gain,
-        audio_preset=audio_preset,
-        tau=tau,
+        gain=eff_gain,
+        audio_preset=eff_preset,
+        tau=eff_tau,
     )
 
     # ── Create AppCore per channel ──
@@ -306,25 +267,29 @@ def main(channel_ids, gain, squelch,
             audio_tap=stack.audio_tap,
             dcs_decoder=stack.dcs_decoder,
             telemetry_queue=stack.telemetry_queue,
-            record=record,
-            max_audio_mb=max_audio_mb,
+            record=eff_record,
+            max_audio_mb=eff_max_audio,
             channel_name=channel_cfg["name"],
             dcs_code=channel_cfg["dcs_code"],
             dcs_mode=channel_cfg["dcs_mode"],
             paths=paths,
             channel_id=channel_id,
+            log_days=eff_log_days,
         )
         stack.app_core = app_core
 
+    # Shutdown coordination
+    shutdown_event = threading.Event()
+
     # ── Create web app ──
-    web_app = create_app(channel_stacks, flowgraph)
+    web_app = create_app(channel_stacks, flowgraph,
+                         config_dir=config_dir, receiver=receiver,
+                         cli_overrides=cli_overrides,
+                         shutdown_event=shutdown_event)
 
     # Wire live audio callbacks
     for channel_id, stack in channel_stacks.items():
         stack.audio_tap._live_callback = web_app.broadcast_audio[channel_id]
-
-    # Shutdown coordination
-    shutdown_event = threading.Event()
     _shutting_down = False
 
     def signal_handler(sig, frame):
@@ -389,6 +354,10 @@ def main(channel_ids, gain, squelch,
     flowgraph.wait()
 
     click.echo("Shutdown complete.")
+
+    if getattr(web_app, '_restart_requested', False):
+        click.echo("Restarting...")
+        os.execv(sys.executable, [sys.executable] + sys.argv)
 
 
 if __name__ == "__main__":

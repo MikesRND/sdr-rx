@@ -2,6 +2,7 @@
 
 See [README.md](README.md) for setup, prerequisites, and usage.
 See [DESIGN.md](DESIGN.md) for DSP signal path, state machine, threading model, file structure, and API endpoints.
+See [DESIGN-UI.md](DESIGN-UI.md) for settings modal UI architecture, data flow, and control locking rules.
 
 ## Architecture
 
@@ -13,7 +14,7 @@ Multi-channel receiver: one RTL-SDR dongle feeds N parallel demodulation chains 
 
 3. **Finalize worker threads** (`app_core.py`): One per channel. Dequeues `(job_id, filename, raw_audio)` from bounded queue, writes WAV, runs sox filter, cleans up disk. Keeps poll thread responsive (see Recording Finalization below).
 
-4. **FastAPI/uvicorn thread** (`web_server.py`): Per-channel WebSocket endpoints for telemetry (`/ws/{ch}`) and live audio (`/audio/{ch}/live`). Per-channel REST endpoints for transmissions, config, and audio files. One telemetry broadcaster task per channel.
+4. **FastAPI/uvicorn thread** (`web_server.py`): Per-channel WebSocket endpoints for telemetry (`/ws/{ch}`) and live audio (`/audio/{ch}/live`). Per-channel REST endpoints for transmissions, config, and audio files. Config CRUD endpoints for channel database and settings management. One telemetry broadcaster task per channel.
 
 ### Key Concepts
 
@@ -28,26 +29,55 @@ Cross-thread communication:
 
 ## Initialization Order (main.py)
 
-1. Resolve channel configs via `resolve_channel_configs()` — validates count, dupes, file existence
-2. Load and validate each channel YAML
-3. Create `AudioTapBlock` + `DCSDecoderBlock` per channel
-4. Build list of `ChannelConfig` for the flowgraph
-5. Create single `ReceiverFlowgraph(channels=[...], receiver=receiver, gain=gain)`
-6. Create `AppCore` per channel (each gets same flowgraph ref + its `channel_id`)
-7. Create FastAPI app via `create_app(channel_stacks, flowgraph)`
-8. Wire each `audio_tap._live_callback = web_app.broadcast_audio[channel_id]`
-9. Start flowgraph → all app_cores → uvicorn
-10. Main thread waits on `shutdown_event`
+1. Load `config.yaml` via `load_config()` — returns seeded defaults (30 FRS/GMRS channels) if file missing
+2. Build CLI overrides dict (gain, squelch, record, etc.) using Click's `ctx.get_parameter_source()`
+3. Determine channels: CLI `-c` flags override `startup_channels` from config
+4. Validate and resolve each channel from config's channel catalog
+5. Create `AudioTapBlock` + `DCSDecoderBlock` per channel
+6. Build list of `ChannelConfig` for the flowgraph
+7. Create single `ReceiverFlowgraph(channels=[...], receiver=receiver, gain=gain)`
+8. Create `AppCore` per channel (each gets same flowgraph ref + its `channel_id`)
+9. Create FastAPI app via `create_app(channel_stacks, flowgraph, config_dir=..., receiver=..., cli_overrides=...)`
+10. Wire each `audio_tap._live_callback = web_app.broadcast_audio[channel_id]`
+11. Start flowgraph → all app_cores → uvicorn
+12. Main thread waits on `shutdown_event`
 
-## Configuration Internals
+## Configuration
+
+### Channel Database (`config.yaml`)
+
+All channels are defined in a single `~/.config/sdr-rx/config.yaml` file. On first run with no config file, seeded defaults (30 FRS/GMRS channels) are loaded in memory. The file is only written when the user saves from the settings UI.
+
+Structure:
+```yaml
+channels:
+  frs1: { name: "FRS/GMRS 1", freq_hz: 462562500, dcs_code: 0, dcs_mode: advisory, squelch: -45.0 }
+  ...
+
+startup_channels: [frs1]
+
+settings:
+  gain: 40
+  default_squelch: -45.0
+  audio_preset: conservative
+  ...
+```
 
 ### Channel Selection
 
-`-c`/`--channel` is required and repeatable (up to `receiver.max_channels`). Each ID loads `~/.config/sdr-rx/channels/<id>.yaml`.
+`startup_channels` in config determines which channels to monitor on startup. CLI `-c` flags override if provided.
 
 - Channel IDs must match `^[a-zA-Z0-9_-]+$`
-- Removed: `--config`, `--freq`, `--dcs-code`, `--name` (all config comes from YAML)
-- Kept: `--init-channel`, `--list-channels` (management commands)
+- Max channels per receiver: 2 (configurable via `Receiver.max_channels`)
+- Bandwidth validation: selected channels must fit within `sample_rate - CHANNEL_RATE` (216 kHz)
+
+### CLI Override Tracking
+
+CLI flags (--gain, --squelch, etc.) override config values for the current run only. Tracked via `cli_overrides` dict passed to `create_app()`. The `/api/runtime` endpoint reports each setting's `source` ("default"/"config"/"cli") and `locked` state. CLI-locked fields are read-only in the UI.
+
+### Running Channel Restrictions
+
+Running channels cannot have `freq_hz`, `dcs_code`, or `dcs_mode` changed (409 Conflict). `name` and `squelch` can be edited — squelch applies live, name takes effect on restart.
 
 ### DCS Role
 

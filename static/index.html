@@ -9,7 +9,18 @@
 <body>
 
 <header>
-    <h1 id="channelName">SDR Monitor</h1>
+    <div class="header-title-row">
+        <h1 id="channelName">SDR Monitor</h1>
+        <div class="header-actions">
+            <button id="settingsBtn" class="settings-btn" title="Settings"
+                    onclick="window.SDR.openSettings(false)">
+                <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="pointer-events:none;">
+                    <circle cx="12" cy="12" r="3"/>
+                    <path d="M19.4 15a1.65 1.65 0 00.33 1.82l.06.06a2 2 0 01-2.83 2.83l-.06-.06a1.65 1.65 0 00-1.82-.33 1.65 1.65 0 00-1 1.51V21a2 2 0 01-4 0v-.09A1.65 1.65 0 009 19.4a1.65 1.65 0 00-1.82.33l-.06.06a2 2 0 01-2.83-2.83l.06-.06A1.65 1.65 0 004.68 15a1.65 1.65 0 00-1.51-1H3a2 2 0 010-4h.09A1.65 1.65 0 004.6 9a1.65 1.65 0 00-.33-1.82l-.06-.06a2 2 0 012.83-2.83l.06.06A1.65 1.65 0 009 4.68a1.65 1.65 0 001-1.51V3a2 2 0 014 0v.09a1.65 1.65 0 001 1.51 1.65 1.65 0 001.82-.33l.06-.06a2 2 0 012.83 2.83l-.06.06A1.65 1.65 0 0019.4 9a1.65 1.65 0 001.51 1H21a2 2 0 010 4h-.09a1.65 1.65 0 00-1.51 1z"/>
+                </svg>
+            </button>
+        </div>
+    </div>
     <div class="status-bar">
         <div class="status-item">
             <span class="indicator squelch-closed" id="squelchIndicator"></span>
@@ -97,7 +108,7 @@
         <div class="panel">
             <h2>Controls</h2>
             <input type="hidden" id="squelchSlider" value="-30">
-            <div class="gain-row">
+            <div class="gain-row" id="gainRow">
                 <span class="gain-label">RF Gain</span>
                 <div class="gain-slider" id="gainTrack">
                     <div class="gain-slider-fill" id="gainFill"></div>
@@ -106,6 +117,8 @@
                 <span class="gain-value"><span id="gainValue">40</span></span>
                 <input type="hidden" id="gainSlider" min="0" max="50" step="1" value="40">
             </div>
+            <div id="gainLockLabel" class="cli-lock-label" style="display:none;">CLI override</div>
+            <div id="squelchLockLabel" class="cli-lock-label" style="display:none;">Squelch: CLI override</div>
         </div>
 
         <!-- Live Audio -->
@@ -132,6 +145,126 @@
     </div>
 </div>
 
+<!-- Settings Modal -->
+<div id="settingsModal" class="modal-overlay" style="display:none;">
+    <div class="settings-modal">
+        <div class="settings-modal-header">
+            <h2>Settings</h2>
+            <div class="settings-header-actions">
+                <button id="restartBtn" class="btn-restart" title="Restart SDR Monitor">Restart</button>
+                <button id="settingsClose" class="modal-close-btn" title="Close" onclick="window.SDR.closeSettings()">&times;</button>
+            </div>
+        </div>
+        <div class="settings-tabs">
+            <button class="settings-tab active" data-tab="channels">Channels</button>
+            <button class="settings-tab" data-tab="settings">Settings</button>
+        </div>
+        <div class="settings-body">
+            <!-- Channels Tab -->
+            <div id="channelsTab" class="settings-tab-content active">
+                <div id="receiverInfoBar" class="receiver-info-bar"></div>
+                <div id="sessionInfo" class="session-info"></div>
+                <div id="channelTableWrap" class="channel-table-wrap">
+                    <table class="channel-table">
+                        <thead>
+                            <tr>
+                                <th class="ch-col-startup" title="Startup selection">Start</th>
+                                <th>ID</th>
+                                <th>Name</th>
+                                <th>Freq (MHz)</th>
+                                <th>DCS</th>
+                                <th>Mode</th>
+                                <th>Squelch</th>
+                                <th>Status</th>
+                                <th>Actions</th>
+                            </tr>
+                        </thead>
+                        <tbody id="channelTableBody"></tbody>
+                    </table>
+                </div>
+                <div id="channelFormWrap" style="display:none;">
+                    <div class="channel-form">
+                        <h3 id="channelFormTitle">Add Channel</h3>
+                        <div id="channelFormErrors" class="form-errors"></div>
+                        <div class="form-grid">
+                            <label>ID <input type="text" id="cfId" placeholder="my_channel"></label>
+                            <label>Name <input type="text" id="cfName" placeholder="My Channel"></label>
+                            <label>Freq MHz <input type="number" id="cfFreq" step="0.000001" placeholder="462.5625"></label>
+                            <label>DCS Code <input type="number" id="cfDcs" min="0" max="777" value="0"></label>
+                            <label>DCS Mode
+                                <select id="cfMode">
+                                    <option value="advisory">advisory</option>
+                                    <option value="strict">strict</option>
+                                </select>
+                            </label>
+                            <label>Squelch dB <input type="number" id="cfSquelch" step="0.5" value="-45" min="-70" max="-5"></label>
+                        </div>
+                        <div class="form-actions">
+                            <button id="cfSave" class="btn-primary">Save</button>
+                            <button id="cfCancel" class="btn-secondary">Cancel</button>
+                        </div>
+                    </div>
+                </div>
+                <div id="startupActions" class="startup-actions" style="display:none;">
+                    <button id="saveStartupBtn" class="btn-primary">Save Startup Set</button>
+                    <button id="revertStartupBtn" class="btn-secondary">Revert</button>
+                </div>
+                <button id="addChannelBtn" class="btn-primary" style="margin-top:12px;">+ Add Channel</button>
+            </div>
+
+            <!-- Settings Tab -->
+            <div id="settingsTab" class="settings-tab-content">
+                <div id="settingsFormWrap" class="settings-form-wrap">
+                    <div id="settingsFormErrors" class="form-errors"></div>
+                    <div id="settingsFields"></div>
+                    <button id="settingsSaveBtn" class="btn-primary" style="margin-top:12px;">Save Settings</button>
+                </div>
+            </div>
+        </div>
+        <div id="settingsBanner" class="settings-banner" style="display:none;"></div>
+    </div>
+</div>
+
+<script>
+// Modal open/close — defined inline so it works even if app.js has errors
+window.SDR = {};
+SDR.openSettings = function(addForm) {
+    document.getElementById("settingsModal").style.display = "flex";
+    document.getElementById("settingsBanner").style.display = "none";
+    var tabs = document.querySelectorAll(".settings-tab");
+    var contents = document.querySelectorAll(".settings-tab-content");
+    for (var i = 0; i < tabs.length; i++) tabs[i].classList.remove("active");
+    for (var i = 0; i < contents.length; i++) contents[i].classList.remove("active");
+    tabs[0].classList.add("active");
+    document.getElementById("channelsTab").classList.add("active");
+    if (SDR._onModalOpen) SDR._onModalOpen(addForm);
+};
+SDR.closeSettings = function() {
+    document.getElementById("settingsModal").style.display = "none";
+};
+// Tab switching
+(function() {
+    var tabs = document.querySelectorAll(".settings-tab");
+    for (var i = 0; i < tabs.length; i++) {
+        tabs[i].onclick = function() {
+            for (var j = 0; j < tabs.length; j++) tabs[j].classList.remove("active");
+            this.classList.add("active");
+            var contents = document.querySelectorAll(".settings-tab-content");
+            for (var j = 0; j < contents.length; j++) contents[j].classList.remove("active");
+            var t = this.getAttribute("data-tab") === "channels" ? "channelsTab" : "settingsTab";
+            document.getElementById(t).classList.add("active");
+        };
+    }
+})();
+// Close on overlay click
+document.getElementById("settingsModal").onclick = function(e) {
+    if (e.target === this) SDR.closeSettings();
+};
+// Close on Escape
+document.onkeydown = function(e) {
+    if (e.key === "Escape") SDR.closeSettings();
+};
+</script>
 <script src="/static/app.js"></script>
 </body>
 </html>

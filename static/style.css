@@ -25,10 +25,22 @@ header {
     border-bottom: 2px solid var(--border);
     padding: 12px 20px;
     display: flex;
-    flex-wrap: wrap;
+    flex-direction: column;
+    gap: 8px;
+}
+
+.header-title-row {
+    display: flex;
     justify-content: space-between;
     align-items: center;
+    width: 100%;
+}
+
+.header-actions {
+    display: flex;
+    align-items: center;
     gap: 8px;
+    flex-shrink: 0;
 }
 
 header h1 {
@@ -71,6 +83,17 @@ header h1 {
 .channel-tab.active {
     color: var(--blue);
     border-bottom-color: var(--blue);
+}
+
+.channel-tab-add {
+    color: var(--gray);
+    font-size: 16px;
+    font-weight: bold;
+    padding: 8px 16px;
+}
+
+.channel-tab-add:hover {
+    color: var(--blue);
 }
 
 .status-bar {
@@ -564,8 +587,6 @@ header h1 {
 
     header {
         padding: 10px 12px;
-        flex-direction: column;
-        align-items: flex-start;
     }
 
     header h1 {
@@ -577,6 +598,12 @@ header h1 {
         gap: 10px 16px;
         font-size: 12px;
         width: 100%;
+    }
+
+    .settings-btn {
+        min-width: 44px;
+        min-height: 44px;
+        padding: 10px;
     }
 
     .panel {
@@ -661,6 +688,471 @@ header h1 {
         width: 14px;
         height: 14px;
     }
+}
+
+/* ── Settings button ──────────────────────────── */
+.settings-btn {
+    -webkit-appearance: none;
+    appearance: none;
+    background: none;
+    border: 1px solid var(--gray);
+    border-radius: 6px;
+    color: var(--text-dim);
+    padding: 4px 8px;
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    transition: color 0.15s, border-color 0.15s;
+    touch-action: manipulation;
+}
+
+.settings-btn:hover {
+    color: var(--text);
+    border-color: var(--blue);
+}
+
+/* ── CLI lock label ──────────────────────────── */
+.cli-lock-label {
+    font-size: 11px;
+    color: var(--yellow);
+    margin-top: 4px;
+}
+
+.gain-row.locked .gain-slider { opacity: 0.4; pointer-events: none; }
+.gain-row.locked .gain-slider-thumb { cursor: default; }
+
+.meter-threshold.locked {
+    cursor: default;
+    opacity: 0.5;
+}
+
+/* ── Modal ───────────────────────────────────── */
+.modal-overlay {
+    position: fixed;
+    inset: 0;
+    background: rgba(0, 0, 0, 0.7);
+    z-index: 1000;
+    display: flex;
+    align-items: flex-start;
+    justify-content: center;
+    padding: 40px 16px;
+    overflow-y: auto;
+}
+
+.settings-modal {
+    background: var(--bg);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    width: 100%;
+    max-width: 900px;
+    max-height: calc(100vh - 80px);
+    display: flex;
+    flex-direction: column;
+    box-shadow: 0 8px 32px rgba(0, 0, 0, 0.6);
+}
+
+.settings-modal-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    padding: 16px 20px;
+    border-bottom: 1px solid var(--border);
+}
+
+.settings-modal-header h2 {
+    font-size: 16px;
+    letter-spacing: 1px;
+    margin: 0;
+}
+
+.settings-header-actions {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+}
+
+.btn-restart {
+    background: none;
+    border: 1px solid var(--gray);
+    border-radius: 6px;
+    color: var(--text-dim);
+    font-family: inherit;
+    font-size: 12px;
+    padding: 4px 12px;
+    cursor: pointer;
+    transition: color 0.15s, border-color 0.15s;
+}
+
+.btn-restart:hover {
+    color: var(--yellow);
+    border-color: var(--yellow);
+}
+
+.modal-close-btn {
+    background: none;
+    border: none;
+    color: var(--text-dim);
+    font-size: 24px;
+    cursor: pointer;
+    padding: 0 4px;
+    line-height: 1;
+}
+
+.modal-close-btn:hover {
+    color: var(--text);
+}
+
+/* ── Tabs ────────────────────────────────────── */
+.settings-tabs {
+    display: flex;
+    border-bottom: 1px solid var(--border);
+    padding: 0 20px;
+}
+
+.settings-tab {
+    padding: 10px 20px;
+    background: none;
+    border: none;
+    border-bottom: 2px solid transparent;
+    color: var(--text-dim);
+    font-family: inherit;
+    font-size: 13px;
+    cursor: pointer;
+    letter-spacing: 1px;
+}
+
+.settings-tab:hover { color: var(--text); }
+.settings-tab.active {
+    color: var(--blue);
+    border-bottom-color: var(--blue);
+}
+
+.settings-body {
+    flex: 1;
+    overflow-y: auto;
+    padding: 16px 20px;
+}
+
+.settings-tab-content {
+    display: none;
+}
+
+.settings-tab-content.active {
+    display: block;
+}
+
+/* ── Receiver info bar ───────────────────────── */
+.receiver-info-bar {
+    font-size: 12px;
+    color: var(--text-dim);
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 8px 12px;
+    margin-bottom: 12px;
+}
+
+/* ── Session info ────────────────────────────── */
+.session-info {
+    font-size: 12px;
+    color: var(--text-dim);
+    margin-bottom: 12px;
+    line-height: 1.6;
+}
+
+.session-info .label { color: var(--text-dim); }
+.session-info .value { color: var(--text); }
+
+/* ── Channel table ───────────────────────────── */
+.channel-table-wrap {
+    max-height: 400px;
+    overflow-y: auto;
+    overflow-x: auto;
+}
+
+.channel-table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 12px;
+}
+
+.channel-table th {
+    text-align: left;
+    padding: 6px 8px;
+    border-bottom: 1px solid var(--border);
+    color: var(--text-dim);
+    position: sticky;
+    top: 0;
+    background: var(--bg);
+    font-size: 11px;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    white-space: nowrap;
+}
+
+.channel-table td {
+    padding: 5px 8px;
+    border-bottom: 1px solid rgba(255,255,255,0.04);
+    white-space: nowrap;
+}
+
+.channel-table tr:hover {
+    background: rgba(255,255,255,0.02);
+}
+
+.ch-col-startup { width: 40px; text-align: center; }
+
+.startup-actions {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin-top: 12px;
+    padding: 10px 12px;
+    background: rgba(41, 121, 255, 0.08);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+}
+
+.channel-table input[type="checkbox"] {
+    cursor: pointer;
+    accent-color: var(--blue);
+}
+
+/* Status badges */
+.status-badge {
+    display: inline-block;
+    padding: 1px 6px;
+    border-radius: 3px;
+    font-size: 10px;
+    font-weight: bold;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+}
+
+.status-badge.running {
+    background: rgba(0, 200, 83, 0.15);
+    color: var(--green);
+}
+
+.status-badge.startup {
+    background: rgba(41, 121, 255, 0.15);
+    color: var(--blue);
+}
+
+/* Lock icon for running channel fields */
+.field-locked {
+    color: var(--text-dim);
+    opacity: 0.5;
+}
+
+.field-locked::after {
+    content: ' \1F512';
+    font-size: 10px;
+}
+
+/* Action buttons in channel table */
+.ch-action-btn {
+    background: none;
+    border: 1px solid var(--gray);
+    border-radius: 4px;
+    color: var(--text-dim);
+    cursor: pointer;
+    padding: 2px 6px;
+    font-size: 12px;
+    margin-right: 4px;
+    transition: color 0.15s, border-color 0.15s;
+}
+
+.ch-action-btn:hover {
+    color: var(--text);
+    border-color: var(--blue);
+}
+
+.ch-action-btn.delete:hover {
+    color: var(--red);
+    border-color: var(--red);
+}
+
+/* ── Channel form ────────────────────────────── */
+.channel-form {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 16px;
+    margin-top: 12px;
+}
+
+.channel-form h3 {
+    font-size: 13px;
+    margin-bottom: 12px;
+    color: var(--text);
+}
+
+.form-grid {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 10px;
+}
+
+.form-grid label {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    font-size: 11px;
+    color: var(--text-dim);
+}
+
+.form-grid input,
+.form-grid select {
+    background: var(--bg);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    color: var(--text);
+    font-family: inherit;
+    font-size: 12px;
+    padding: 6px 8px;
+}
+
+.form-grid input:focus,
+.form-grid select:focus {
+    outline: none;
+    border-color: var(--blue);
+}
+
+.form-grid input:disabled,
+.form-grid select:disabled {
+    opacity: 0.4;
+    cursor: not-allowed;
+}
+
+.form-actions {
+    display: flex;
+    gap: 8px;
+    margin-top: 12px;
+}
+
+.form-errors {
+    font-size: 12px;
+    color: var(--red);
+    margin-bottom: 8px;
+}
+
+/* ── Buttons ─────────────────────────────────── */
+.btn-primary {
+    background: var(--blue);
+    color: white;
+    border: none;
+    border-radius: 6px;
+    padding: 8px 16px;
+    font-family: inherit;
+    font-size: 13px;
+    cursor: pointer;
+    transition: opacity 0.15s;
+}
+
+.btn-primary:hover { opacity: 0.85; }
+
+.btn-secondary {
+    background: var(--border);
+    color: var(--text);
+    border: 1px solid var(--gray);
+    border-radius: 6px;
+    padding: 8px 16px;
+    font-family: inherit;
+    font-size: 13px;
+    cursor: pointer;
+}
+
+.btn-secondary:hover {
+    border-color: var(--text-dim);
+}
+
+/* ── Settings form ───────────────────────────── */
+.settings-form-wrap {
+    max-width: 600px;
+}
+
+.setting-row {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    padding: 8px 0;
+    border-bottom: 1px solid rgba(255,255,255,0.04);
+}
+
+.setting-label {
+    flex: 0 0 140px;
+    font-size: 12px;
+    color: var(--text-dim);
+}
+
+.setting-input {
+    flex: 1;
+}
+
+.setting-input input,
+.setting-input select {
+    background: var(--bg);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    color: var(--text);
+    font-family: inherit;
+    font-size: 12px;
+    padding: 6px 8px;
+    width: 100%;
+}
+
+.setting-input input:focus,
+.setting-input select:focus {
+    outline: none;
+    border-color: var(--blue);
+}
+
+.setting-input input:disabled,
+.setting-input select:disabled {
+    opacity: 0.4;
+    cursor: not-allowed;
+}
+
+.source-badge {
+    font-size: 10px;
+    padding: 1px 5px;
+    border-radius: 3px;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    white-space: nowrap;
+}
+
+.source-badge.default { background: var(--gray); color: #ccc; }
+.source-badge.config { background: rgba(41, 121, 255, 0.2); color: var(--blue); }
+.source-badge.cli { background: rgba(255, 214, 0, 0.2); color: var(--yellow); }
+
+.apply-timing {
+    font-size: 10px;
+    color: var(--text-dim);
+    white-space: nowrap;
+}
+
+/* ── Settings banner ─────────────────────────── */
+.settings-banner {
+    padding: 10px 20px;
+    font-size: 12px;
+    border-top: 1px solid var(--border);
+}
+
+.settings-banner.success {
+    color: var(--green);
+}
+
+.settings-banner.success a {
+    color: var(--yellow);
+    text-decoration: underline;
+    cursor: pointer;
+}
+
+.settings-banner.error {
+    color: var(--red);
 }
 
 @media (max-width: 400px) {
