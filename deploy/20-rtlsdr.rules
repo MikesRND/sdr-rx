@@ -1,0 +1,18 @@
+# RTL-SDR USB dongles — grant plugdev group access, tag for software radio
+# Covers RTL2832U and RTL2838 chipsets (RTL-SDR Blog V3, V4, NooElec, generic)
+
+# RTL2832U
+SUBSYSTEM=="usb", ATTRS{idVendor}=="0bda", ATTRS{idProduct}=="2832", \
+  GROUP="plugdev", MODE="0660", ENV{ID_SOFTWARE_RADIO}="1"
+
+# RTL2838UHIDIR (most common — RTL-SDR Blog V3)
+SUBSYSTEM=="usb", ATTRS{idVendor}=="0bda", ATTRS{idProduct}=="2838", \
+  GROUP="plugdev", MODE="0660", ENV{ID_SOFTWARE_RADIO}="1"
+
+# RTL-SDR Blog V4 (different product ID)
+SUBSYSTEM=="usb", ATTRS{idVendor}=="0bda", ATTRS{idProduct}=="2839", \
+  GROUP="plugdev", MODE="0660", ENV{ID_SOFTWARE_RADIO}="1"
+
+# NooElec NESDR
+SUBSYSTEM=="usb", ATTRS{idVendor}=="0bda", ATTRS{idProduct}=="2834", \
+  GROUP="plugdev", MODE="0660", ENV{ID_SOFTWARE_RADIO}="1"
