@@ -70,6 +70,7 @@ Override defaults when running `bootstrap.sh`:
 | `REPO_BRANCH` | `main` | Branch to clone |
 | `LOCAL_SOURCE` | _(auto-detect)_ | Local path to copy instead of cloning |
 | `SWAP_MB` | `256` | Swap file size in MB |
+| `DISABLE_RADIOS` | `false` | Set `true` to disable WiFi + Bluetooth (use when on Ethernet) |
 | `SDR_CHANNELS` | _(from config)_ | Space-separated channel IDs |
 | `SDR_GAIN` | _(from config)_ | RTL-SDR tuner gain (dB) |
 | `SDR_SQUELCH` | _(from config)_ | RF squelch threshold (dB) |
@@ -82,7 +83,7 @@ Override defaults when running `bootstrap.sh`:
 4. **Udev rules** — grants USB access to RTL-SDR without root
 5. **Blacklists DVB-T driver** — prevents kernel from claiming the dongle
 6. **Systemd service** — auto-start, watchdog, memory limits, restart-on-failure
-7. **Firmware tuning** — `gpu_mem=16`, hardware watchdog, disables WiFi/BT
+7. **Firmware tuning** — `gpu_mem=16`, hardware watchdog, optionally disables WiFi/BT
 8. **Swap** — 256 MB safety net for GNU Radio memory spikes
 
 ## Managing the Service
@@ -159,5 +160,5 @@ sudo systemctl restart sdr-rx
 - **1 channel**: comfortable (~40-50% one core for DSP)
 - **2 channels**: feasible but leaves little headroom
 - **RAM**: ~200-300 MB typical with GNU Radio + Python + FastAPI
-- Disabling WiFi/BT frees USB bandwidth (shared bus on Pi 3B+) and reduces RF interference near the SDR antenna
-- Use Ethernet for reliable remote access
+- WiFi works fine for the dashboard — the data rates are low (~16 kbit/s audio + telemetry)
+- If on Ethernet, consider `DISABLE_RADIOS=true` to free USB bandwidth (shared bus on Pi 3B+) and reduce RF interference near the SDR antenna

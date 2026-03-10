@@ -28,6 +28,7 @@ REPO_URL="${REPO_URL:-}"
 REPO_BRANCH="${REPO_BRANCH:-main}"
 LOCAL_SOURCE="${LOCAL_SOURCE:-}"          # set to a path to copy instead of clone
 SWAP_MB="${SWAP_MB:-256}"
+DISABLE_RADIOS="${DISABLE_RADIOS:-false}" # set to "true" to disable WiFi+BT
 SDR_CHANNELS="${SDR_CHANNELS:-}"         # e.g. "frs1" or "frs1 frs2"
 SDR_GAIN="${SDR_GAIN:-}"
 SDR_SQUELCH="${SDR_SQUELCH:-}"
@@ -241,15 +242,19 @@ if [[ -f "${CONFIG_TXT}" ]]; then
     # Enable hardware watchdog
     apply_setting "dtparam=watchdog" "on" "${CONFIG_TXT}"
 
-    # Disable wifi + bluetooth to free USB bandwidth and reduce interference
-    if ! grep -q "^dtoverlay=disable-wifi" "${CONFIG_TXT}" 2>/dev/null; then
-        echo "# SDR-RX: disable radios to reduce interference" >> "${CONFIG_TXT}"
-        echo "dtoverlay=disable-wifi" >> "${CONFIG_TXT}"
-        echo "dtoverlay=disable-bt" >> "${CONFIG_TXT}"
-        CHANGED=true
-        echo "  Added: disable-wifi, disable-bt overlays"
+    # Optionally disable wifi + bluetooth to free USB bandwidth and reduce interference
+    if [[ "${DISABLE_RADIOS}" == "true" ]]; then
+        if ! grep -q "^dtoverlay=disable-wifi" "${CONFIG_TXT}" 2>/dev/null; then
+            echo "# SDR-RX: disable radios to reduce interference" >> "${CONFIG_TXT}"
+            echo "dtoverlay=disable-wifi" >> "${CONFIG_TXT}"
+            echo "dtoverlay=disable-bt" >> "${CONFIG_TXT}"
+            CHANGED=true
+            echo "  Added: disable-wifi, disable-bt overlays"
+        else
+            echo "  Already set: wifi/bt disabled"
+        fi
     else
-        echo "  Already set: wifi/bt disabled"
+        echo "  WiFi/BT kept enabled (set DISABLE_RADIOS=true to disable)"
     fi
 
     if $CHANGED; then
