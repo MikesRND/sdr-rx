@@ -772,6 +772,7 @@ header h1 {
     gap: 12px;
 }
 
+.btn-update,
 .btn-restart {
     background: none;
     border: 1px solid var(--gray);
@@ -782,6 +783,11 @@ header h1 {
     padding: 4px 12px;
     cursor: pointer;
     transition: color 0.15s, border-color 0.15s;
+}
+
+.btn-update:hover {
+    color: var(--blue);
+    border-color: var(--blue);
 }
 
 .btn-restart:hover {
@@ -1153,6 +1159,10 @@ header h1 {
 
 .settings-banner.error {
     color: var(--red);
+}
+
+.settings-banner.info {
+    color: var(--blue);
 }
 
 @media (max-width: 400px) {

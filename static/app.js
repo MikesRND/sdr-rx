@@ -771,6 +771,7 @@
     // ══════════════════════════════════════════════════════
 
     var restartBtn = document.getElementById("restartBtn");
+    var updateBtn = document.getElementById("updateBtn");
     var settingsBanner = document.getElementById("settingsBanner");
 
     // Wire modal open callback into the inline modal code
@@ -798,6 +799,31 @@
                 showBanner("Restart failed", "error");
                 restartBtn.disabled = false;
                 restartBtn.textContent = "Restart";
+            });
+    });
+
+    // Update
+    updateBtn.addEventListener("click", function() {
+        if (!confirm("Update SDR-RX? This will pull latest code and restart the service.")) return;
+        updateBtn.disabled = true;
+        updateBtn.textContent = "Updating...";
+        showBanner("Updating \u2014 this may take a minute...", "info");
+        fetch("/api/update", { method: "POST" })
+            .then(function(r) { return r.json().then(function(d) { return { ok: r.ok, data: d }; }); })
+            .then(function(res) {
+                if (res.ok) {
+                    showBanner("Update complete \u2014 reloading...", "success");
+                    setTimeout(function() { location.reload(); }, 5000);
+                } else {
+                    showBanner("Update failed: " + (res.data.output || "unknown error"), "error");
+                    updateBtn.disabled = false;
+                    updateBtn.textContent = "Update";
+                }
+            })
+            .catch(function() {
+                showBanner("Update failed \u2014 connection lost (service may be restarting)", "error");
+                // Service restart will kill this connection; try reloading after a delay
+                setTimeout(function() { location.reload(); }, 10000);
             });
     });
 

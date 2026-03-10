@@ -75,12 +75,16 @@ echo ""
 echo "── [3/7] Installing application to ${INSTALL_DIR} ──"
 mkdir -p "${INSTALL_DIR}"
 
-if [[ -n "${LOCAL_SOURCE}" ]]; then
-    # Copy from local path (useful when script is inside the repo)
-    echo "  Copying from ${LOCAL_SOURCE}..."
-    rsync -a --exclude='.venv' --exclude='__pycache__' --exclude='.git' \
-        "${LOCAL_SOURCE}/" "${INSTALL_DIR}/"
-elif [[ -n "${REPO_URL}" ]]; then
+_detect_repo_url() {
+    # Try to detect git remote URL from a source directory
+    local dir="$1"
+    if [[ -d "${dir}/.git" ]]; then
+        git -C "${dir}" remote get-url origin 2>/dev/null || true
+    fi
+}
+
+if [[ -n "${REPO_URL}" ]]; then
+    # Clone from URL (or update existing clone)
     if [[ -d "${INSTALL_DIR}/.git" ]]; then
         echo "  Pulling latest from ${REPO_BRANCH}..."
         git -C "${INSTALL_DIR}" fetch origin "${REPO_BRANCH}"
@@ -90,14 +94,37 @@ elif [[ -n "${REPO_URL}" ]]; then
         git clone --branch "${REPO_BRANCH}" --depth 1 \
             "${REPO_URL}" "${INSTALL_DIR}"
     fi
+elif [[ -n "${LOCAL_SOURCE}" ]]; then
+    # Copy from local path (used by prepare-sd.sh / firstboot)
+    echo "  Copying from ${LOCAL_SOURCE}..."
+    DETECTED_URL="$(_detect_repo_url "${LOCAL_SOURCE}")"
+    rsync -a --exclude='.venv' --exclude='__pycache__' --exclude='.git' \
+        "${LOCAL_SOURCE}/" "${INSTALL_DIR}/"
+    # Initialize git so update.sh can pull later
+    if [[ -n "${DETECTED_URL}" && ! -d "${INSTALL_DIR}/.git" ]]; then
+        echo "  Initializing git for future updates (${DETECTED_URL})..."
+        git -C "${INSTALL_DIR}" init --quiet
+        git -C "${INSTALL_DIR}" remote add origin "${DETECTED_URL}"
+        git -C "${INSTALL_DIR}" add -A
+        git -C "${INSTALL_DIR}" commit --quiet -m "Initial install from local source"
+    fi
 else
     # Auto-detect: if this script lives inside the repo, copy from there
     SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
     REPO_ROOT="$(dirname "${SCRIPT_DIR}")"
     if [[ -f "${REPO_ROOT}/main.py" && -f "${REPO_ROOT}/gr_engine.py" ]]; then
         echo "  Copying from detected repo at ${REPO_ROOT}..."
+        DETECTED_URL="$(_detect_repo_url "${REPO_ROOT}")"
         rsync -a --exclude='.venv' --exclude='__pycache__' --exclude='.git' \
             "${REPO_ROOT}/" "${INSTALL_DIR}/"
+        # Initialize git so update.sh can pull later
+        if [[ -n "${DETECTED_URL}" && ! -d "${INSTALL_DIR}/.git" ]]; then
+            echo "  Initializing git for future updates (${DETECTED_URL})..."
+            git -C "${INSTALL_DIR}" init --quiet
+            git -C "${INSTALL_DIR}" remote add origin "${DETECTED_URL}"
+            git -C "${INSTALL_DIR}" add -A
+            git -C "${INSTALL_DIR}" commit --quiet -m "Initial install from local source"
+        fi
     else
         echo "Error: no source found. Set REPO_URL or LOCAL_SOURCE." >&2
         exit 1
@@ -208,6 +235,12 @@ systemctl daemon-reload
 systemctl enable sdr-rx.service
 echo "  Installed and enabled. Will start on next boot."
 echo "  Manual control: systemctl {start|stop|restart|status} sdr-rx"
+
+# Allow the sdr user to run update.sh via sudo (for web UI update button)
+SUDOERS_FILE="/etc/sudoers.d/sdr-rx-update"
+echo "${SDR_USER} ALL=(root) NOPASSWD: ${INSTALL_DIR}/deploy/update.sh" > "${SUDOERS_FILE}"
+chmod 440 "${SUDOERS_FILE}"
+echo "  Sudoers rule installed for web-triggered updates."
 
 # ── 6. Firmware / boot tuning ──
 echo ""

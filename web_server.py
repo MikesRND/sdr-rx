@@ -5,6 +5,7 @@ import json
 import os
 import queue
 import struct
+import subprocess
 import time
 from pathlib import Path
 
@@ -416,6 +417,37 @@ def create_app(channel_stacks, flowgraph, *, config_dir=None, receiver=None, cli
         if shutdown_event:
             shutdown_event.set()
         return JSONResponse(content={"status": "restarting"})
+
+    # ── Software update ───────────────────────────────────
+
+    @app.post("/api/update")
+    async def update_software():
+        """Pull latest code, rebuild venv, restart service via update.sh."""
+        update_script = Path(__file__).parent / "deploy" / "update.sh"
+        if not update_script.is_file():
+            return JSONResponse(status_code=404, content={"error": "update.sh not found"})
+
+        loop = asyncio.get_running_loop()
+        try:
+            result = await loop.run_in_executor(None, lambda: subprocess.run(
+                ["sudo", str(update_script)],
+                capture_output=True, text=True, timeout=300,
+            ))
+            if result.returncode == 0:
+                return JSONResponse(content={
+                    "status": "ok",
+                    "output": result.stdout[-2000:] if result.stdout else "",
+                })
+            else:
+                return JSONResponse(status_code=500, content={
+                    "status": "error",
+                    "output": (result.stdout + result.stderr)[-2000:],
+                })
+        except subprocess.TimeoutExpired:
+            return JSONResponse(status_code=504, content={
+                "status": "error",
+                "output": "Update timed out after 5 minutes",
+            })
 
     # ── Per-channel telemetry WebSocket ───────────────────
 

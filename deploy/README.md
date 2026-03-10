@@ -138,16 +138,26 @@ sudo systemctl stop sdr-rx
 sudo systemctl disable sdr-rx
 ```
 
-## Upgrading
+## Updating
 
-Re-run the bootstrap. It's idempotent — pulls latest code, rebuilds venv,
-reloads the service:
+### From the web dashboard
+
+Open Settings (gear icon) and click **Update**. This pulls the latest code,
+rebuilds the venv, and restarts the service. The page reloads automatically.
+
+### From SSH
 
 ```bash
-cd /opt/sdr-rx
-sudo git pull
-sudo bash deploy/bootstrap.sh
-sudo systemctl restart sdr-rx
+sudo bash /opt/sdr-rx/deploy/update.sh
+```
+
+### Full re-provision
+
+For major upgrades (new system packages, config changes), re-run the bootstrap:
+
+```bash
+sudo bash /opt/sdr-rx/deploy/bootstrap.sh
+sudo reboot
 ```
 
 ## Changing Channels
