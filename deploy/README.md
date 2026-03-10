@@ -2,64 +2,98 @@
 
 Automated headless deployment for Raspberry Pi 3B+ (also works on Pi 4/5).
 
-## Quick Start
+## Flash Once, Boot Ready
 
-### 1. Flash the SD card
+Two steps on your computer, then just apply power.
+
+### 1. Flash Pi OS with Raspberry Pi Imager
 
 Use [Raspberry Pi Imager](https://www.raspberrypi.com/software/) to write
 **Raspberry Pi OS Lite (64-bit, Bookworm)** to a microSD card (16 GB+).
 
 In Imager's settings (gear icon), configure:
-- **Hostname**: `sdr-rx` (or your preference)
+- **Hostname**: `sdr-rx`
 - **Enable SSH**: password or key-based
 - **Username/password**: your login user
-- **WiFi**: configure if needed (Ethernet recommended for reliability)
+- **WiFi**: your SSID + password
 - **Locale**: your timezone
 
-### 2. Boot and connect
+**Do not eject the SD card yet.**
 
-Insert the SD card, plug in Ethernet + power, then SSH in:
+### 2. Prepare the SD card
+
+With the SD card still inserted in your computer, run from the repo:
 
 ```bash
-ssh <your-user>@sdr-rx.local
+# Basic — uses default channel config
+sudo bash deploy/prepare-sd.sh /dev/sdX
+
+# With channel presets
+sudo bash deploy/prepare-sd.sh /dev/sdX --channels "frs1 frs2" --gain 30
+
+# With squelch override
+sudo bash deploy/prepare-sd.sh /dev/sdX --channels frs1 --gain 30 --squelch -28
+
+# Ethernet-only (disables WiFi/BT for less RF interference)
+sudo bash deploy/prepare-sd.sh /dev/sdX --channels frs1 --disable-radios
 ```
 
-### 3. Run the bootstrap
+Replace `/dev/sdX` with your SD card device (`/dev/sdb`, `/dev/mmcblk0`, etc.).
+Use `lsblk` to find it.
 
-**From the repo (if cloned on the Pi):**
+### 3. Boot
+
+1. Eject the SD card
+2. Insert into Pi with RTL-SDR dongle plugged in
+3. Apply power
+
+**That's it.** On first boot the Pi will:
+- Connect to WiFi
+- Install all packages (~10-15 minutes)
+- Configure the sdr-rx service
+- Reboot automatically
+
+After the second boot, the dashboard is live at: `http://sdr-rx.local:8080`
+
+### Monitor first-boot progress
+
+If you want to watch it work (optional):
+
 ```bash
+ssh <user>@sdr-rx.local
+journalctl -u sdr-rx-firstboot -f
+```
+
+---
+
+## Alternative: SSH + Bootstrap
+
+If you prefer to SSH in and run it manually, or if you're on macOS/Windows
+where mounting ext4 isn't straightforward:
+
+```bash
+ssh <user>@sdr-rx.local
+git clone https://github.com/<owner>/sdr-rx.git
 cd sdr-rx
-sudo bash deploy/bootstrap.sh
-```
-
-**One-liner from GitHub:**
-```bash
-curl -fsSL https://raw.githubusercontent.com/<owner>/sdr-rx/main/deploy/bootstrap.sh | sudo bash
-```
-
-**With channel/gain presets:**
-```bash
-SDR_CHANNELS="frs1 frs2" SDR_GAIN=30 SDR_SQUELCH=-28 sudo -E bash deploy/bootstrap.sh
-```
-
-### 4. Plug in RTL-SDR and reboot
-
-```bash
+SDR_CHANNELS="frs1" SDR_GAIN=30 sudo -E bash deploy/bootstrap.sh
 sudo reboot
 ```
 
-The service starts automatically. Check status:
+---
 
-```bash
-sudo systemctl status sdr-rx
-sudo journalctl -u sdr-rx -f
-```
+## prepare-sd.sh Options
 
-Dashboard: `http://sdr-rx.local:8080`
+| Option | Description |
+|---|---|
+| `<device>` | SD card block device (required) |
+| `--channels "ch1 ch2"` | Channel IDs to monitor |
+| `--gain <dB>` | RTL-SDR tuner gain |
+| `--squelch <dB>` | RF squelch threshold |
+| `--disable-radios` | Disable WiFi + Bluetooth |
 
-## Environment Variables
+## bootstrap.sh Environment Variables
 
-Override defaults when running `bootstrap.sh`:
+Override defaults when running `bootstrap.sh` directly:
 
 | Variable | Default | Description |
 |---|---|---|
@@ -70,18 +104,18 @@ Override defaults when running `bootstrap.sh`:
 | `REPO_BRANCH` | `main` | Branch to clone |
 | `LOCAL_SOURCE` | _(auto-detect)_ | Local path to copy instead of cloning |
 | `SWAP_MB` | `256` | Swap file size in MB |
-| `DISABLE_RADIOS` | `false` | Set `true` to disable WiFi + Bluetooth (use when on Ethernet) |
+| `DISABLE_RADIOS` | `false` | Set `true` to disable WiFi + Bluetooth |
 | `SDR_CHANNELS` | _(from config)_ | Space-separated channel IDs |
 | `SDR_GAIN` | _(from config)_ | RTL-SDR tuner gain (dB) |
 | `SDR_SQUELCH` | _(from config)_ | RF squelch threshold (dB) |
 
-## What the Bootstrap Does
+## What Gets Installed
 
 1. **System packages** — gnuradio, gr-osmosdr, sox, etc.
-2. **Service user** — creates a locked-down `sdr` account in `plugdev` group
-3. **Application** — clones/copies repo to `/opt/sdr-rx`, creates venv
-4. **Udev rules** — grants USB access to RTL-SDR without root
-5. **Blacklists DVB-T driver** — prevents kernel from claiming the dongle
+2. **Service user** — locked-down `sdr` account in `plugdev` group
+3. **Application** — `/opt/sdr-rx` with Python venv
+4. **Udev rules** — RTL-SDR USB access without root
+5. **DVB-T blacklist** — prevents kernel from claiming the dongle
 6. **Systemd service** — auto-start, watchdog, memory limits, restart-on-failure
 7. **Firmware tuning** — `gpu_mem=16`, hardware watchdog, optionally disables WiFi/BT
 8. **Swap** — 256 MB safety net for GNU Radio memory spikes
@@ -134,8 +168,7 @@ ExecStart=/opt/sdr-rx/.venv/bin/python /opt/sdr-rx/main.py --data-dir /var/lib/s
 
 Then: `sudo systemctl restart sdr-rx`
 
-Or edit `/var/lib/sdr-rx` config and restart (the web UI settings modal also
-writes to config.yaml and can trigger a restart).
+Or use the web UI settings modal to change channels and trigger a restart.
 
 ## Storing Recordings on USB Drive
 
@@ -161,4 +194,4 @@ sudo systemctl restart sdr-rx
 - **2 channels**: feasible but leaves little headroom
 - **RAM**: ~200-300 MB typical with GNU Radio + Python + FastAPI
 - WiFi works fine for the dashboard — the data rates are low (~16 kbit/s audio + telemetry)
-- If on Ethernet, consider `DISABLE_RADIOS=true` to free USB bandwidth (shared bus on Pi 3B+) and reduce RF interference near the SDR antenna
+- If on Ethernet, consider `--disable-radios` to free USB bandwidth (shared bus on Pi 3B+) and reduce RF interference near the SDR antenna

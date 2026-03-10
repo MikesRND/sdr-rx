@@ -1,0 +1,19 @@
+[Unit]
+Description=SDR-RX First Boot Provisioning
+After=network-online.target
+Wants=network-online.target
+ConditionPathExists=/opt/sdr-rx/.firstboot
+
+[Service]
+Type=oneshot
+ExecStart=/bin/bash /opt/sdr-rx/deploy/bootstrap.sh
+ExecStartPost=/bin/rm -f /opt/sdr-rx/.firstboot
+ExecStartPost=/bin/systemctl disable sdr-rx-firstboot.service
+ExecStartPost=/bin/systemctl reboot
+Environment=DEBIAN_FRONTEND=noninteractive
+StandardOutput=journal+console
+StandardError=journal+console
+TimeoutStartSec=900
+
+[Install]
+WantedBy=multi-user.target
